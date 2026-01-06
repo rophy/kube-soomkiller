@@ -104,7 +104,7 @@ Monitor node-level swap I/O and proactively terminate pods under memory pressure
 
 ### 1. Node-Level Swap I/O Monitoring
 
-The controller monitors `/proc/vmstat` for swap activity:
+The controller monitors `/proc/vmstat` for swap activity. This file shows system-wide kernel statistics and is not namespaced, so it can be read from within a container without special volume mounts:
 
 ```bash
 $ cat /proc/vmstat | grep -E '^psw'
@@ -230,6 +230,11 @@ kubectl label node <node> swap=enabled
 nodeSelector:
   swap: enabled
 ```
+
+**Required volume mounts:**
+- `/sys/fs/cgroup` (read-only) - for per-pod memory metrics and PSI
+
+Note: `/proc/vmstat` is system-wide and accessible without special mounts. No privileged mode required.
 
 ## Deployment Recommendations
 
