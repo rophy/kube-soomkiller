@@ -6,6 +6,52 @@ A Kubernetes controller that provides graceful pod termination under memory pres
 - **s**oft **oom** **killer** - graceful termination instead of immediate SIGKILL
 - **s**wap **oom** **killer** - swap-aware memory pressure management
 
+## Getting Started
+
+### Prerequisites
+
+- Kubernetes cluster with swap enabled on nodes (`NodeSwap` feature gate)
+- NBD-based swap with tc rate limiting configured on target nodes
+- Nodes labeled with `swap=enabled`
+
+### Installation
+
+```bash
+# Deploy the controller
+kubectl apply -f deploy/namespace.yaml
+kubectl apply -f deploy/serviceaccount.yaml
+kubectl apply -f deploy/rbac.yaml
+kubectl apply -f deploy/daemonset.yaml
+
+# Verify it's running
+kubectl get pods -n kube-soomkiller
+```
+
+### Configuration
+
+Edit `deploy/daemonset.yaml` to adjust parameters:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tc-queue-threshold` | 100 | tc queue depth (packets) to trigger action |
+| `--psi-threshold` | 50 | PSI full avg10 threshold for pod selection |
+| `--poll-interval` | 5s | How often to check metrics |
+| `--dry-run` | true | Log actions without executing |
+| `--tc-device` | lo | Network device for tc stats |
+
+### Building from Source
+
+```bash
+# Build binary
+make build
+
+# Build container image
+make image
+
+# Run tests
+make test
+```
+
 ## Problem Statement
 
 When a pod exceeds its memory limit, the Linux kernel's OOM killer sends SIGKILL - an immediate, uninterruptible termination. This causes:
