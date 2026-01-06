@@ -11,7 +11,7 @@ A Kubernetes controller that provides graceful pod termination under memory pres
 ### Prerequisites
 
 - Kubernetes cluster with swap enabled on nodes (`NodeSwap` feature gate)
-- NBD-based swap with tc rate limiting configured on target nodes
+- Swap configured on target nodes (dedicated swap disk recommended)
 - Nodes labeled with `swap=enabled`
 
 ### Installation
@@ -33,11 +33,14 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--tc-queue-threshold` | 100 | tc queue depth (packets) to trigger action |
-| `--psi-threshold` | 50 | PSI full avg10 threshold for pod selection |
-| `--poll-interval` | 5s | How often to check metrics |
+| `--swap-io-threshold` | 1000 | Swap I/O rate (pages/sec) to trigger action |
+| `--sustained-duration` | 10s | How long threshold must be exceeded |
+| `--psi-threshold` | 50 | Minimum PSI full avg10 for pod selection |
+| `--poll-interval` | 1s | How often to sample /proc/vmstat |
+| `--cooldown-period` | 30s | Wait time after killing a pod |
 | `--dry-run` | true | Log actions without executing |
-| `--tc-device` | lo | Network device for tc stats |
+
+**Note:** With 1s poll interval and 10s sustained duration, the controller requires 10 consecutive samples above threshold before acting. This filters out short spikes while remaining responsive to real pressure.
 
 ### Building from Source
 
@@ -65,85 +68,66 @@ When a pod exceeds its memory limit, the Linux kernel's OOM killer sends SIGKILL
 
 ## Solution Overview
 
-Use NBD-based swap with traffic control (tc) rate limiting to create a "pressure buffer" that slows down pods under memory pressure instead of killing them immediately. A controller monitors this buffer and proactively terminates pods before the system deadlocks.
+Monitor node-level swap I/O and proactively terminate pods under memory pressure before the system becomes unresponsive. Swap provides a natural "buffer" - pods under pressure are stalled on swap I/O, giving the controller time to detect and act.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                         Architecture                          │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│   Pod Memory Pressure                                        │
-│          │                                                   │
-│          ▼                                                   │
-│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐   │
-│   │  NBD Swap   │────▶│  tc Queue   │────▶│  NBD Server │   │
-│   │  (write)    │     │  (buffer)   │     │  (drain)    │   │
-│   └─────────────┘     └─────────────┘     └─────────────┘   │
-│                              │                               │
-│                              │ monitor                       │
-│                              ▼                               │
-│                    ┌─────────────────┐                       │
-│                    │   Controller    │                       │
-│                    │   (DaemonSet)   │                       │
-│                    └────────┬────────┘                       │
-│                             │                                │
-│                             │ kubectl delete pod             │
-│                             ▼                                │
-│                    ┌─────────────────┐                       │
-│                    │ Graceful Stop   │                       │
-│                    │ (SIGTERM + wait)│                       │
-│                    └─────────────────┘                       │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       Architecture                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   /proc/vmstat (node-level)                                 │
+│   ├── pswpin:  pages swapped in                             │
+│   └── pswpout: pages swapped out                            │
+│          │                                                  │
+│          │ swap_io_rate > threshold                         │
+│          │ for sustained_duration                           │
+│          ▼                                                  │
+│   ┌─────────────────┐      ┌─────────────────────────────┐  │
+│   │   Controller    │      │  Per-pod metrics (cgroup)   │  │
+│   │   (DaemonSet)   │◀────▶│  - memory.swap.current      │  │
+│   └────────┬────────┘      │  - memory.pressure (PSI)    │  │
+│            │               └─────────────────────────────┘  │
+│            │                                                │
+│            │ Select victim:                                 │
+│            │   where swap_usage > 0                         │
+│            │   max by psi_full_avg10                        │
+│            ▼                                                │
+│   ┌─────────────────┐                                       │
+│   │ kubectl delete  │──▶ SIGTERM ──▶ Grace Period ──▶ Clean │
+│   │ (graceful)      │                                       │
+│   └─────────────────┘                                       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Components
+## How It Works
 
-### 1. NBD Swap with tc Rate Limiting
+### 1. Node-Level Swap I/O Monitoring
 
-Network Block Device (NBD) provides swap over a loopback connection. Traffic control (tc) rate limits this connection, creating an artificial bottleneck.
+The controller monitors `/proc/vmstat` for swap activity:
 
-**How it works:**
-- Swap writes go through NBD over loopback
-- tc HTB qdisc limits bandwidth (e.g., 50 Mbit/s)
-- When write rate exceeds limit, packets queue up
-- Queued packets = time buffer before deadlock
-
-**Configuration:**
 ```bash
-# Create NBD swap file
-dd if=/dev/zero of=/swapfile bs=1M count=6144
-nbd-server 10809 /swapfile
-
-# Rate limit loopback
-tc qdisc add dev lo root handle 1: htb default 10
-tc class add dev lo parent 1: classid 1:10 htb rate 50mbit
-
-# Connect and enable
-nbd-client localhost 10809 /dev/nbd0
-mkswap /dev/nbd0
-swapon /dev/nbd0
+$ cat /proc/vmstat | grep -E '^psw'
+pswpin 12345    # cumulative pages swapped in
+pswpout 67890   # cumulative pages swapped out
 ```
 
-### 2. Controller DaemonSet
-
-Runs on each swap-enabled node, monitoring pressure and taking action.
-
-**Monitors:**
-| Metric | Source | Purpose |
-|--------|--------|---------|
-| tc queue depth | `tc -s qdisc show` | System-level pressure indicator |
-| PSI full avg10 | cgroup `memory.pressure` | Per-pod thrashing detection |
-| Swap usage | cgroup `memory.swap.current` | Identify pods using swap |
-
-**Trigger Condition:**
+By sampling periodically, it calculates the swap I/O rate:
 ```
-tc_queue_depth > threshold
+swap_io_rate = (pswpin_delta + pswpout_delta) / interval
 ```
 
-When tc queue fills beyond threshold, the system is at risk of deadlock (packets dropped, NBD requests lost, processes stuck in D state).
+### 2. Trigger Condition
 
-**Pod Selection:**
+```
+swap_io_rate > swap_io_threshold
+  for duration > sustained_duration
+```
+
+When swap I/O exceeds the threshold for a sustained period, the node is under memory pressure and action is needed.
+
+### 3. Pod Selection
+
 ```
 candidate_pods = pods where (swap_usage > 0)
 victim = max(candidate_pods, key=psi_full_avg10)
@@ -153,18 +137,80 @@ Select the pod with:
 1. Non-zero swap usage (actively using swap)
 2. Highest PSI `full` value (most severe memory stalls)
 
-**Action:**
+### 4. Graceful Termination
+
 ```bash
-kubectl delete pod <victim> --grace-period=<configured>
+kubectl delete pod <victim>
 ```
 
-Using `kubectl delete` instead of direct SIGTERM because:
+Using `kubectl delete` because:
 - Kubernetes handles SIGTERM → grace period → SIGKILL
 - Proper cleanup (endpoint removal, finalizers)
 - Respects pod's `terminationGracePeriodSeconds`
 - Controller only needs K8s API access
 
-### 3. Kubernetes Configuration
+### 5. Cooldown
+
+After killing a pod, the controller waits for `cooldown-period` before taking further action. This:
+- Gives the system time to stabilize
+- Allows the killed pod's memory to be reclaimed
+- Prevents cascading failures from killing too many pods
+
+## Why This Works
+
+### Traditional OOM Kill
+```
+Memory limit hit → SIGKILL → Immediate death
+```
+
+### Soft OOM Kill
+```
+Memory limit hit → Swap thrashing → Controller detects → kubectl delete → SIGTERM → Grace period → Clean shutdown
+```
+
+**Key insight:** Thrashing itself provides the buffer time. When a pod is swapping heavily, it's stalled on I/O - not progressing. This gives the controller time to detect the pressure and act before the system becomes unresponsive.
+
+## Metrics Explained
+
+### Swap I/O Rate
+
+```bash
+$ cat /proc/vmstat | grep -E '^psw'
+pswpin 12345
+pswpout 67890
+```
+
+- `pswpin`: Pages read from swap (cumulative)
+- `pswpout`: Pages written to swap (cumulative)
+
+Sample every second, calculate delta. High sustained rates indicate memory pressure.
+
+### PSI (Pressure Stall Information)
+
+```bash
+$ cat /sys/fs/cgroup/.../memory.pressure
+some avg10=17.42 avg60=3.24 avg300=0.68 total=2649745
+full avg10=13.37 avg60=2.41 avg300=0.50 total=2098080
+```
+
+- `some`: % of time at least one task stalled on memory
+- `full`: % of time ALL tasks stalled on memory
+- `avg10`: 10-second moving average
+
+High `full` indicates severe thrashing.
+
+**Note:** PSI measures memory pressure broadly, not just swap I/O. A pod can have high PSI from page cache churn without using swap. This is why we filter by `swap_usage > 0`.
+
+### Swap Usage
+
+```bash
+$ cat /sys/fs/cgroup/.../memory.swap.current
+20971520  # bytes
+```
+
+Pods with swap > 0 are candidates for termination under pressure.
+
+## Kubernetes Configuration
 
 **Kubelet swap settings:**
 ```yaml
@@ -185,89 +231,56 @@ nodeSelector:
   swap: enabled
 ```
 
-## Configuration Options
+## Deployment Recommendations
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `tcQueueThreshold` | Queue depth triggering action | Configurable per node |
-| `pollInterval` | How often to check metrics | 5s |
-| `cooldownPeriod` | Wait time after killing a pod | 30s |
-| `minPsiThreshold` | Minimum PSI to consider pod as candidate | 10% |
-| `dryRun` | Log actions without executing | false |
+### Dedicated Swap Disk
 
-## Metrics Explained
-
-### tc Queue Depth
+For production, use a dedicated disk or partition for swap:
 
 ```bash
-$ tc -s qdisc show dev lo
-qdisc htb 1: root ... direct_packets_stat 0
- Sent 1234567 bytes 8901 pkt (dropped 0, overlimits 5678 requeues 0)
- backlog 12345b 89p requeues 0
-         ^^^^^^ ^^^
-         bytes  packets in queue
+# Separate disk for swap
+mkswap /dev/sdb
+swapon /dev/sdb
 ```
 
-When `backlog` grows and `dropped` increases, the queue is overflowing.
+This isolates swap I/O from the root filesystem, preventing swap activity from starving kubelet, etcd, and other control plane components.
 
-### PSI (Pressure Stall Information)
+### Tuning Parameters
 
-```bash
-$ cat /sys/fs/cgroup/.../memory.pressure
-some avg10=17.42 avg60=3.24 avg300=0.68 total=2649745
-full avg10=13.37 avg60=2.41 avg300=0.50 total=2098080
-```
+| Scenario | swap-io-threshold | sustained-duration |
+|----------|------------------|-------------------|
+| Conservative | 500 pages/sec | 15s |
+| Balanced | 1000 pages/sec | 10s |
+| Aggressive | 2000 pages/sec | 5s |
 
-- `some`: % of time at least one task stalled on memory
-- `full`: % of time ALL tasks stalled on memory
-- `avg10`: 10-second moving average
-- `total`: cumulative stall time in microseconds
-
-High `full` indicates thrashing - the pod is struggling but may not be growing swap (same pages swapped in/out repeatedly).
-
-### Swap Usage
-
-```bash
-$ cat /sys/fs/cgroup/.../memory.swap.current
-20971520  # bytes
-```
-
-Pods with swap > 0 are candidates for termination under pressure.
-
-## Why This Works
-
-### Traditional OOM Kill
-```
-Memory limit hit → SIGKILL → Immediate death
-```
-
-### Soft OOM Kill
-```
-Memory limit hit → Swap to NBD → tc throttles → Queue fills → Controller detects → kubectl delete → SIGTERM → Grace period → Clean shutdown
-```
-
-The tc queue acts as a time buffer. Instead of instant death, the pod slows down while the controller has time to:
-1. Detect the pressure
-2. Select the appropriate victim
-3. Initiate graceful termination
+Start conservative and tune based on your workload characteristics.
 
 ## Limitations
 
-### tc Queue Overflow
-If sustained swap I/O exceeds the rate limit for too long, the tc queue overflows, packets drop, and NBD deadlocks. The controller must act before this happens.
-
-**Sizing consideration:**
-```
-Queue can buffer: queue_size_bytes / (swap_rate - drain_rate)
-```
-
-If incoming swap rate sustains above drain rate, no queue size is sufficient. The controller must terminate pods before this becomes critical.
-
 ### Per-Pod Swap I/O Attribution
-cgroup v2 does not expose per-cgroup `pswpin`/`pswpout` counters. We use PSI as a proxy for thrashing detection instead of direct swap I/O measurement.
+
+cgroup v2 does not expose per-cgroup `pswpin`/`pswpout` counters. We use:
+- Node-level swap I/O for trigger
+- Per-pod PSI + swap usage for victim selection
+
+This means we detect node pressure, then infer the worst offender from cgroup metrics.
+
+### PSI vs Swap I/O
+
+PSI measures memory pressure broadly, not just swap I/O. A pod may have high PSI from:
+- Page cache reclaim
+- Direct reclaim
+- Memory compaction
+
+We mitigate this by requiring `swap_usage > 0` for victim selection.
 
 ### Single Point of Failure
-The controller DaemonSet must be highly available. If it fails, the system falls back to kernel OOM kill behavior (after potential deadlock).
+
+The controller DaemonSet must be running. If it fails:
+- System falls back to kernel OOM kill behavior
+- No graceful termination
+
+Recommendation: Set high priority class and resource requests to ensure controller survives pressure.
 
 ## Comparison with Alternatives
 
@@ -275,21 +288,19 @@ The controller DaemonSet must be highly available. If it fails, the system falls
 |----------|--------|--------------|-------|
 | Kernel OOM Kill | SIGKILL | None | Per-container |
 | Memory QoS (cgroups v2) | Throttle | N/A | Per-container |
-| Kubelet Node Eviction | SIGTERM | Yes | Node-wide |
+| Kubelet Node Eviction | SIGTERM | Yes | Node-wide threshold |
 | **Soft OOM Killer** | SIGTERM | Yes | Per-pod, swap-aware |
 
 ## Future Enhancements
 
-1. **eBPF-based swap I/O tracking** - More accurate per-pod swap I/O attribution
+1. **eBPF-based swap I/O tracking** - Per-pod swap I/O attribution
 2. **Prometheus metrics export** - Integrate with existing monitoring
-3. **PodDisruptionBudget awareness** - Optionally respect PDB (may need override for emergencies)
-4. **Predictive termination** - Use swap growth rate to predict overflow before it happens
+3. **PodDisruptionBudget awareness** - Optionally respect PDB
+4. **Predictive termination** - Use swap growth rate to predict pressure
 
 ## References
 
 - [Kubernetes NodeSwap Feature](https://kubernetes.io/docs/concepts/architecture/nodes/#swap-memory)
 - [cgroups v2 Memory Controller](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory)
 - [PSI - Pressure Stall Information](https://docs.kernel.org/accounting/psi.html)
-- [NBD - Network Block Device](https://nbd.sourceforge.io/)
-- [tc - Traffic Control](https://man7.org/linux/man-pages/man8/tc.8.html)
 - [Kubernetes Issue #40157 - Make OOM not be SIGKILL](https://github.com/kubernetes/kubernetes/issues/40157)
