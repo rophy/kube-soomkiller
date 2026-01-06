@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,84 +21,62 @@ type PSI struct {
 	FullTotal  uint64
 }
 
-// TCStats represents traffic control queue statistics
-type TCStats struct {
-	Backlog     int64  // bytes in queue
-	BacklogPkts int64  // packets in queue
-	Dropped     int64  // dropped packets
-	Overlimits  int64  // rate-limited packets
-	Sent        int64  // bytes sent
-	SentPkts    int64  // packets sent
+// SwapIOStats represents node-level swap I/O counters from /proc/vmstat
+type SwapIOStats struct {
+	PswpIn  uint64 // pages swapped in (cumulative)
+	PswpOut uint64 // pages swapped out (cumulative)
 }
 
 // PodMetrics contains memory-related metrics for a pod
 type PodMetrics struct {
-	CgroupPath   string
-	SwapCurrent  int64   // bytes
-	MemoryCurrent int64  // bytes
-	PSI          PSI
+	CgroupPath    string
+	SwapCurrent   int64 // bytes
+	MemoryCurrent int64 // bytes
+	PSI           PSI
 }
 
-// Collector gathers metrics from cgroups and tc
+// Collector gathers metrics from cgroups and /proc/vmstat
 type Collector struct {
-	cgroupRoot string
-	tcDevice   string
+	cgroupRoot  string
+	vmstatPath  string
 }
 
 // NewCollector creates a new metrics collector
-func NewCollector(cgroupRoot, tcDevice string) *Collector {
+func NewCollector(cgroupRoot string) *Collector {
 	return &Collector{
 		cgroupRoot: cgroupRoot,
-		tcDevice:   tcDevice,
+		vmstatPath: "/proc/vmstat",
 	}
 }
 
-// GetTCStats retrieves tc queue statistics for the configured device
-func (c *Collector) GetTCStats() (*TCStats, error) {
-	cmd := exec.Command("tc", "-s", "qdisc", "show", "dev", c.tcDevice)
-	output, err := cmd.Output()
+// GetSwapIOStats retrieves swap I/O counters from /proc/vmstat
+func (c *Collector) GetSwapIOStats() (*SwapIOStats, error) {
+	file, err := os.Open(c.vmstatPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to run tc: %w", err)
+		return nil, fmt.Errorf("failed to open %s: %w", c.vmstatPath, err)
+	}
+	defer file.Close()
+
+	stats := &SwapIOStats{}
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+
+		switch fields[0] {
+		case "pswpin":
+			stats.PswpIn, _ = strconv.ParseUint(fields[1], 10, 64)
+		case "pswpout":
+			stats.PswpOut, _ = strconv.ParseUint(fields[1], 10, 64)
+		}
 	}
 
-	return parseTCStats(string(output))
-}
-
-func parseTCStats(output string) (*TCStats, error) {
-	stats := &TCStats{}
-
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		// Parse: Sent 210325976 bytes 134175 pkt (dropped 0, overlimits 5678 requeues 0)
-		if strings.HasPrefix(line, "Sent") {
-			parts := strings.Fields(line)
-			if len(parts) >= 4 {
-				stats.Sent, _ = strconv.ParseInt(parts[1], 10, 64)
-				stats.SentPkts, _ = strconv.ParseInt(parts[3], 10, 64)
-			}
-			// Parse dropped and overlimits from parentheses
-			if idx := strings.Index(line, "dropped"); idx != -1 {
-				var dropped, overlimits int64
-				fmt.Sscanf(line[idx:], "dropped %d, overlimits %d", &dropped, &overlimits)
-				stats.Dropped = dropped
-				stats.Overlimits = overlimits
-			}
-		}
-
-		// Parse: backlog 12345b 89p requeues 0
-		if strings.HasPrefix(line, "backlog") {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				// Parse "12345b" -> 12345
-				bytesStr := strings.TrimSuffix(parts[1], "b")
-				stats.Backlog, _ = strconv.ParseInt(bytesStr, 10, 64)
-				// Parse "89p" -> 89
-				pktsStr := strings.TrimSuffix(parts[2], "p")
-				stats.BacklogPkts, _ = strconv.ParseInt(pktsStr, 10, 64)
-			}
-		}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", c.vmstatPath, err)
 	}
 
 	return stats, nil

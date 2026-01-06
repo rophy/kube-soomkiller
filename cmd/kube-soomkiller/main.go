@@ -21,21 +21,23 @@ func main() {
 		kubeconfig        string
 		nodeName          string
 		pollInterval      time.Duration
-		tcQueueThreshold  int
+		swapIOThreshold   int
+		sustainedDuration time.Duration
+		cooldownPeriod    time.Duration
 		psiThreshold      float64
 		cgroupRoot        string
-		tcDevice          string
 		dryRun            bool
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not set)")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node to monitor")
-	flag.DurationVar(&pollInterval, "poll-interval", 5*time.Second, "How often to check metrics")
-	flag.IntVar(&tcQueueThreshold, "tc-queue-threshold", 1000, "tc queue depth threshold to trigger action")
-	flag.Float64Var(&psiThreshold, "psi-threshold", 50.0, "PSI full avg10 threshold to consider pod for termination")
+	flag.DurationVar(&pollInterval, "poll-interval", 1*time.Second, "How often to sample /proc/vmstat")
+	flag.IntVar(&swapIOThreshold, "swap-io-threshold", 1000, "Swap I/O rate (pages/sec) to trigger action")
+	flag.DurationVar(&sustainedDuration, "sustained-duration", 10*time.Second, "How long threshold must be exceeded before action")
+	flag.DurationVar(&cooldownPeriod, "cooldown-period", 30*time.Second, "Wait time after killing a pod")
+	flag.Float64Var(&psiThreshold, "psi-threshold", 50.0, "Minimum PSI full avg10 for pod selection")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
-	flag.StringVar(&tcDevice, "tc-device", "lo", "Network device for tc stats")
-	flag.BoolVar(&dryRun, "dry-run", false, "Log actions without executing")
+	flag.BoolVar(&dryRun, "dry-run", true, "Log actions without executing")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -45,8 +47,8 @@ func main() {
 	}
 
 	klog.Infof("Starting kube-soomkiller on node %s", nodeName)
-	klog.Infof("Config: poll-interval=%s, tc-queue-threshold=%d, psi-threshold=%.1f, dry-run=%v",
-		pollInterval, tcQueueThreshold, psiThreshold, dryRun)
+	klog.Infof("Config: poll-interval=%s, swap-io-threshold=%d pages/sec, sustained-duration=%s, cooldown-period=%s, psi-threshold=%.1f, dry-run=%v",
+		pollInterval, swapIOThreshold, sustainedDuration, cooldownPeriod, psiThreshold, dryRun)
 
 	// Create Kubernetes client
 	k8sClient, err := createK8sClient(kubeconfig)
@@ -55,17 +57,19 @@ func main() {
 	}
 
 	// Create metrics collector
-	metricsCollector := metrics.NewCollector(cgroupRoot, tcDevice)
+	metricsCollector := metrics.NewCollector(cgroupRoot)
 
 	// Create controller
 	ctrl := controller.New(controller.Config{
-		NodeName:         nodeName,
-		PollInterval:     pollInterval,
-		TCQueueThreshold: tcQueueThreshold,
-		PSIThreshold:     psiThreshold,
-		DryRun:           dryRun,
-		K8sClient:        k8sClient,
-		Metrics:          metricsCollector,
+		NodeName:          nodeName,
+		PollInterval:      pollInterval,
+		SwapIOThreshold:   swapIOThreshold,
+		SustainedDuration: sustainedDuration,
+		CooldownPeriod:    cooldownPeriod,
+		PSIThreshold:      psiThreshold,
+		DryRun:            dryRun,
+		K8sClient:         k8sClient,
+		Metrics:           metricsCollector,
 	})
 
 	// Handle shutdown gracefully

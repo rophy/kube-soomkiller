@@ -21,8 +21,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o kube-soomkiller ./cmd/
 # Runtime stage
 FROM docker.io/alpine:3.21
 
-RUN apk add --no-cache iproute2
-
 COPY --from=builder /app/kube-soomkiller /usr/local/bin/kube-soomkiller
 
 ENTRYPOINT ["/usr/local/bin/kube-soomkiller"]

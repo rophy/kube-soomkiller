@@ -21,14 +21,15 @@ spec:
       tolerations:
         - operator: Exists
       hostPID: true
-      hostNetwork: true
       containers:
         - name: kube-soomkiller
           image: kube-soomkiller:latest  # Replace with your registry
           args:
-            - --tc-queue-threshold=100
+            - --swap-io-threshold=1000
+            - --sustained-duration=10s
+            - --cooldown-period=30s
             - --psi-threshold=50
-            - --poll-interval=5s
+            - --poll-interval=1s
             - --dry-run=true  # Set to false for production
             - -v=2
           env:
@@ -42,6 +43,9 @@ spec:
             - name: cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
+            - name: proc
+              mountPath: /proc
+              readOnly: true
           resources:
             requests:
               cpu: 10m
@@ -53,4 +57,8 @@ spec:
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
+            type: Directory
+        - name: proc
+          hostPath:
+            path: /proc
             type: Directory

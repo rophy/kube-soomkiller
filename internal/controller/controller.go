@@ -14,26 +14,34 @@ import (
 
 // Config holds controller configuration
 type Config struct {
-	NodeName         string
-	PollInterval     time.Duration
-	TCQueueThreshold int
-	PSIThreshold     float64
-	DryRun           bool
-	K8sClient        *kubernetes.Clientset
-	Metrics          *metrics.Collector
+	NodeName          string
+	PollInterval      time.Duration
+	SwapIOThreshold   int           // pages/sec to trigger action
+	SustainedDuration time.Duration // how long threshold must be exceeded
+	CooldownPeriod    time.Duration // wait time after killing a pod
+	PSIThreshold      float64       // minimum PSI for pod selection
+	DryRun            bool
+	K8sClient         *kubernetes.Clientset
+	Metrics           *metrics.Collector
 }
 
 // Controller monitors swap pressure and terminates pods when necessary
 type Controller struct {
 	config Config
+
+	// State tracking
+	lastSwapIO        *metrics.SwapIOStats
+	lastSampleTime    time.Time
+	thresholdExceeded time.Time // when threshold was first exceeded
+	lastKillTime      time.Time // when we last killed a pod
 }
 
 // PodCandidate represents a pod that may be terminated
 type PodCandidate struct {
-	Namespace   string
-	Name        string
-	CgroupPath  string
-	SwapBytes   int64
+	Namespace    string
+	Name         string
+	CgroupPath   string
+	SwapBytes    int64
 	PSIFullAvg10 float64
 }
 
@@ -47,6 +55,8 @@ func New(config Config) *Controller {
 // Run starts the controller main loop
 func (c *Controller) Run(ctx context.Context) error {
 	klog.Infof("Controller started, polling every %s", c.config.PollInterval)
+	klog.Infof("Trigger: swap I/O > %d pages/sec for %s",
+		c.config.SwapIOThreshold, c.config.SustainedDuration)
 
 	ticker := time.NewTicker(c.config.PollInterval)
 	defer ticker.Stop()
@@ -64,24 +74,65 @@ func (c *Controller) Run(ctx context.Context) error {
 }
 
 func (c *Controller) reconcile(ctx context.Context) error {
-	// Get tc queue stats
-	tcStats, err := c.config.Metrics.GetTCStats()
+	now := time.Now()
+
+	// Get current swap I/O stats
+	swapIO, err := c.config.Metrics.GetSwapIOStats()
 	if err != nil {
-		return fmt.Errorf("failed to get tc stats: %w", err)
+		return fmt.Errorf("failed to get swap I/O stats: %w", err)
 	}
 
-	klog.V(2).Infof("tc stats: backlog=%d bytes (%d pkts), dropped=%d, overlimits=%d",
-		tcStats.Backlog, tcStats.BacklogPkts, tcStats.Dropped, tcStats.Overlimits)
+	// Calculate swap I/O rate if we have a previous sample
+	var swapIORate float64
+	if c.lastSwapIO != nil {
+		elapsed := now.Sub(c.lastSampleTime).Seconds()
+		if elapsed > 0 {
+			pswpInDelta := swapIO.PswpIn - c.lastSwapIO.PswpIn
+			pswpOutDelta := swapIO.PswpOut - c.lastSwapIO.PswpOut
+			swapIORate = float64(pswpInDelta+pswpOutDelta) / elapsed
+		}
+	}
 
-	// Check if tc queue threshold is exceeded
-	if tcStats.BacklogPkts < int64(c.config.TCQueueThreshold) {
-		klog.V(2).Infof("tc queue (%d pkts) below threshold (%d), no action needed",
-			tcStats.BacklogPkts, c.config.TCQueueThreshold)
+	// Update last sample
+	c.lastSwapIO = swapIO
+	c.lastSampleTime = now
+
+	klog.V(2).Infof("Swap I/O: pswpin=%d, pswpout=%d, rate=%.1f pages/sec",
+		swapIO.PswpIn, swapIO.PswpOut, swapIORate)
+
+	// Check if in cooldown period
+	if !c.lastKillTime.IsZero() && now.Sub(c.lastKillTime) < c.config.CooldownPeriod {
+		remaining := c.config.CooldownPeriod - now.Sub(c.lastKillTime)
+		klog.V(2).Infof("In cooldown period, %s remaining", remaining.Round(time.Second))
 		return nil
 	}
 
-	klog.Warningf("tc queue threshold exceeded: %d pkts >= %d threshold",
-		tcStats.BacklogPkts, c.config.TCQueueThreshold)
+	// Check if swap I/O rate exceeds threshold
+	if swapIORate < float64(c.config.SwapIOThreshold) {
+		// Reset threshold exceeded time
+		c.thresholdExceeded = time.Time{}
+		klog.V(2).Infof("Swap I/O rate (%.1f) below threshold (%d), no action needed",
+			swapIORate, c.config.SwapIOThreshold)
+		return nil
+	}
+
+	// Threshold exceeded - track when it started
+	if c.thresholdExceeded.IsZero() {
+		c.thresholdExceeded = now
+		klog.Infof("Swap I/O threshold exceeded: %.1f pages/sec >= %d threshold",
+			swapIORate, c.config.SwapIOThreshold)
+	}
+
+	// Check if sustained long enough
+	sustainedFor := now.Sub(c.thresholdExceeded)
+	if sustainedFor < c.config.SustainedDuration {
+		klog.Infof("Threshold exceeded for %s (need %s), waiting...",
+			sustainedFor.Round(time.Second), c.config.SustainedDuration)
+		return nil
+	}
+
+	klog.Warningf("Swap I/O threshold exceeded for %s: %.1f pages/sec >= %d threshold",
+		sustainedFor.Round(time.Second), swapIORate, c.config.SwapIOThreshold)
 
 	// Find pods using swap
 	candidates, err := c.findCandidates(ctx)
@@ -90,7 +141,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 
 	if len(candidates) == 0 {
-		klog.Warning("tc queue is full but no pods using swap found")
+		klog.Warning("Swap I/O is high but no pods using swap found")
 		return nil
 	}
 
@@ -104,6 +155,10 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	if err := c.terminatePod(ctx, victim); err != nil {
 		return fmt.Errorf("failed to terminate pod: %w", err)
 	}
+
+	// Update state after successful kill
+	c.lastKillTime = now
+	c.thresholdExceeded = time.Time{} // Reset to re-evaluate after cooldown
 
 	return nil
 }
