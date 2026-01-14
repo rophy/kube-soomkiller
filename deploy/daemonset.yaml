@@ -22,7 +22,7 @@ spec:
         - operator: Exists
       containers:
         - name: kube-soomkiller
-          image: kube-soomkiller:latest  # Replace with your registry
+          image: ttl.sh/kube-soomkiller
           args:
             - --swap-io-threshold=1000
             - --sustained-duration=10s
