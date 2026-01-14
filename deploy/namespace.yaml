@@ -4,10 +4,3 @@ metadata:
   name: kube-soomkiller
   labels:
     name: kube-soomkiller
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: monitoring
-  labels:
-    name: monitoring
