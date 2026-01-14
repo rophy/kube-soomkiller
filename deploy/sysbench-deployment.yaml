@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sysbench
+  labels:
+    app: sysbench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sysbench
+  template:
+    metadata:
+      labels:
+        app: sysbench
+    spec:
+      containers:
+      - name: sysbench
+        image: perconalab/sysbench:1.1
+        command: ["sleep", "infinity"]

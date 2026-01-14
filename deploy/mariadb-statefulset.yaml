@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  labels:
+    app: mariadb
+spec:
+  serviceName: mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mariadb
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
+      containers:
+      - name: mariadb
+        image: mariadb:11
+        args:
+        - --innodb-buffer-pool-size=256M
+        env:
+        - name: MARIADB_ROOT_PASSWORD
+          value: "testpass"
+        - name: MARIADB_DATABASE
+          value: "testdb"
+        resources:
+          requests:
+            memory: "256Mi"
+          limits:
+            memory: "512Mi"
+        ports:
+        - containerPort: 3306
+          name: mysql

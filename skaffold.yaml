@@ -1,0 +1,18 @@
+apiVersion: skaffold/v4beta11
+kind: Config
+metadata:
+  name: kube-soomkiller
+build:
+  artifacts:
+    - image: kube-soomkiller
+      context: .
+      docker:
+        dockerfile: Dockerfile
+  local:
+    push: false
+manifests:
+  kustomize:
+    paths:
+      - deploy
+deploy:
+  kubectl: {}

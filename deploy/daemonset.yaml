@@ -15,9 +15,9 @@ spec:
         app: kube-soomkiller
     spec:
       serviceAccountName: kube-soomkiller
-      # Only run on swap-enabled nodes
+      # Only run on worker nodes (which have swap configured)
       nodeSelector:
-        swap: enabled
+        node-role.kubernetes.io/worker: "true"
       tolerations:
         - operator: Exists
       containers:
