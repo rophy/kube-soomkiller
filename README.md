@@ -47,8 +47,36 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 | `--poll-interval` | 1s | How often to sample /proc/vmstat |
 | `--cooldown-period` | 30s | Wait time after killing a pod |
 | `--dry-run` | true | Log actions without executing |
+| `--metrics-addr` | :8080 | Address to serve Prometheus metrics |
 
 **Note:** With 1s poll interval and 10s sustained duration, the controller requires 10 consecutive samples above threshold before acting. This filters out short spikes while remaining responsive to real pressure.
+
+### Prometheus Metrics
+
+The controller exposes metrics on `:8080/metrics`:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `soomkiller_swap_io_rate_pages_per_second` | Gauge | Current swap I/O rate |
+| `soomkiller_swap_io_threshold_exceeded` | Gauge | 1 if threshold exceeded, 0 otherwise |
+| `soomkiller_swap_io_threshold_exceeded_duration_seconds` | Gauge | How long threshold has been exceeded |
+| `soomkiller_cooldown_remaining_seconds` | Gauge | Seconds remaining in cooldown |
+| `soomkiller_pods_killed_total` | Counter | Total pods killed |
+| `soomkiller_candidate_pods_count` | Gauge | Pods currently using swap |
+| `soomkiller_pod_swap_bytes{namespace,pod}` | Gauge | Swap usage per pod |
+| `soomkiller_pod_psi_full_avg10{namespace,pod}` | Gauge | PSI value per pod |
+
+Configuration metrics (`soomkiller_config_*`) are also exposed for visibility.
+
+**Health endpoint:** `/healthz` returns `ok` when healthy.
+
+**Prometheus scraping:** The daemonset includes annotations for auto-discovery:
+```yaml
+annotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+```
 
 ### Building from Source
 
@@ -430,9 +458,8 @@ Recommendation: Set high priority class and resource requests to ensure controll
 ## Future Enhancements
 
 1. **eBPF-based swap I/O tracking** - Per-pod swap I/O attribution
-2. **Prometheus metrics export** - Integrate with existing monitoring
-3. **PodDisruptionBudget awareness** - Optionally respect PDB
-4. **Predictive termination** - Use swap growth rate to predict pressure
+2. **PodDisruptionBudget awareness** - Optionally respect PDB
+3. **Predictive termination** - Use swap growth rate to predict pressure
 
 ## References
 
