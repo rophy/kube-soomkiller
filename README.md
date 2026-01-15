@@ -16,6 +16,14 @@ A Kubernetes controller that provides graceful pod termination under memory pres
 
 ### Installation
 
+**Using skaffold (recommended for development):**
+
+```bash
+skaffold run
+```
+
+**Manual deployment:**
+
 ```bash
 # Deploy the controller
 kubectl apply -f deploy/namespace.yaml
@@ -54,6 +62,129 @@ make image
 # Run tests
 make test
 ```
+
+### Testing with K3s (Multipass)
+
+A complete test environment is provided using K3s on Multipass VMs with encrypted swap:
+
+```bash
+# Prerequisites: Install Multipass
+# Ubuntu: sudo snap install multipass
+# macOS: brew install multipass
+
+# Create K3s cluster with 3 nodes (1 server + 2 workers with 6GB swap each)
+./scripts/setup-k3s-multipass.sh up
+
+# Export kubeconfig
+./scripts/setup-k3s-multipass.sh kubeconfig
+
+# Check cluster status
+./scripts/setup-k3s-multipass.sh status
+
+# Deploy kube-soomkiller and test workloads
+export KUBECONFIG=~/.kube/k3s-multipass.yaml
+skaffold run
+
+# Verify swap is configured on workers
+multipass exec k3s-worker1 -- free -h
+multipass exec k3s-worker1 -- swapon --show
+
+# Clean up
+./scripts/setup-k3s-multipass.sh down
+```
+
+**Manual kubeconfig setup (if not using the script):**
+
+```bash
+# Get kubeconfig from K3s server
+multipass exec k3s-server -- sudo cat /etc/rancher/k3s/k3s.yaml > ~/.kube/k3s-multipass.yaml
+
+# Replace localhost with server IP
+SERVER_IP=$(multipass info k3s-server --format json | jq -r '.info["k3s-server"].ipv4[0]')
+sed -i "s/127.0.0.1/$SERVER_IP/g" ~/.kube/k3s-multipass.yaml
+
+# Set permissions
+chmod 600 ~/.kube/k3s-multipass.yaml
+
+# Use it
+export KUBECONFIG=~/.kube/k3s-multipass.yaml
+kubectl get nodes
+```
+
+**Manual encrypted swap setup (for any Linux node):**
+
+```bash
+# Create swap file (6GB)
+sudo mkdir -p /var/swap
+sudo dd if=/dev/zero of=/var/swap/swapfile bs=1M count=6144
+sudo chmod 600 /var/swap/swapfile
+
+# Configure encrypted swap with ephemeral key
+echo 'swap_crypt /var/swap/swapfile /dev/urandom swap,cipher=aes-xts-plain64,size=512' | sudo tee -a /etc/crypttab
+
+# Enable the encrypted swap
+sudo cryptdisks_start swap_crypt
+sudo mkswap /dev/mapper/swap_crypt
+sudo swapon /dev/mapper/swap_crypt
+
+# Make persistent
+echo '/dev/mapper/swap_crypt none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Verify
+swapon --show
+sudo dmsetup status  # Should show "swap_crypt: ... crypt"
+```
+
+**Kubelet swap configuration (K3s < 1.32):**
+
+K3s versions before 1.32 don't auto-read kubelet drop-in configs. Pass the config explicitly:
+
+```bash
+# Create kubelet config
+sudo mkdir -p /etc/rancher/k3s
+cat <<EOF | sudo tee /etc/rancher/k3s/kubelet-swap.yaml
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+failSwapOn: false
+memorySwap:
+  swapBehavior: LimitedSwap
+EOF
+
+# Install K3s agent with swap support
+curl -sfL https://get.k3s.io | \
+  K3S_URL=https://<SERVER_IP>:6443 \
+  K3S_TOKEN=<TOKEN> \
+  INSTALL_K3S_EXEC='--kubelet-arg=config=/etc/rancher/k3s/kubelet-swap.yaml' \
+  sh -
+```
+
+**Running the stress test:**
+
+```bash
+# Create sysbench database
+kubectl exec -n kube-soomkiller mariadb-0 -- \
+  mariadb -uroot -ptestpass -e "CREATE DATABASE IF NOT EXISTS sbtest;"
+
+# Prepare tables
+kubectl exec -n kube-soomkiller deploy/sysbench -- \
+  sysbench /usr/share/sysbench/oltp_read_write.lua \
+  --mysql-host=mariadb --mysql-port=3306 \
+  --mysql-user=root --mysql-password=testpass \
+  --mysql-db=sbtest --tables=10 --table-size=100000 prepare
+
+# Run stress test (150 threads to trigger swap pressure)
+kubectl exec -n kube-soomkiller deploy/sysbench -- \
+  sysbench /usr/share/sysbench/oltp_read_write.lua \
+  --mysql-host=mariadb --mysql-port=3306 \
+  --mysql-user=root --mysql-password=testpass \
+  --mysql-db=sbtest --tables=10 --table-size=100000 \
+  --threads=150 --time=120 --report-interval=10 run
+
+# Monitor soomkiller logs
+kubectl logs -n kube-soomkiller daemonset/kube-soomkiller -f
+```
+
+When swap I/O exceeds 1000 pages/sec for 10 seconds, soomkiller will terminate the MariaDB pod gracefully.
 
 ## Problem Statement
 
