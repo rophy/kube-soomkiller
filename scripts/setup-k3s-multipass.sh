@@ -89,14 +89,29 @@ install_k3s_server() {
   '
 }
 
-# Install K3s agent
+# Install K3s agent with swap support
 install_k3s_agent() {
   local worker_name="$1"
   local server_ip="$2"
   local token="$3"
+  local with_swap="${4:-false}"
 
-  log_info "Installing K3s agent on $worker_name..."
-  multipass exec "$worker_name" -- bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION='$K3S_VERSION' K3S_URL=https://${server_ip}:6443 K3S_TOKEN=${token} sh -"
+  log_info "Installing K3s agent on $worker_name (swap=$with_swap)..."
+
+  if [ "$with_swap" = "true" ]; then
+    # K3s < 1.32 doesn't auto-read kubelet drop-in configs, so we use --kubelet-arg
+    # to pass the config file directly
+    multipass exec "$worker_name" -- bash -c "
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION='$K3S_VERSION' \
+        K3S_URL=https://${server_ip}:6443 \
+        K3S_TOKEN=${token} \
+        INSTALL_K3S_EXEC='--kubelet-arg=config=/etc/rancher/k3s/kubelet-swap.yaml' \
+        sh -
+    "
+  else
+    multipass exec "$worker_name" -- bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION='$K3S_VERSION' K3S_URL=https://${server_ip}:6443 K3S_TOKEN=${token} sh -"
+  fi
 }
 
 # Configure encrypted swap on a node
@@ -133,31 +148,32 @@ configure_swap() {
   "
 }
 
-# Configure kubelet for swap support
-configure_kubelet_swap() {
+# Create kubelet config file for swap support (called BEFORE installing K3s agent)
+prepare_kubelet_swap_config() {
   local vm_name="$1"
 
-  log_info "Configuring kubelet for swap on $vm_name..."
+  log_info "Creating kubelet swap config on $vm_name..."
 
   multipass exec "$vm_name" -- sudo bash -c '
     set -e
 
-    # Create kubelet config drop-in
-    mkdir -p /var/lib/rancher/k3s/agent/etc/kubelet.conf.d
+    # Create config directory
+    mkdir -p /etc/rancher/k3s
 
-    cat > /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-swap.conf << CONFIG
+    # Create kubelet config file for swap support
+    # Note: K3s < 1.32 does not auto-read drop-in configs, so we create a full config
+    # and pass it via --kubelet-arg=config=/etc/rancher/k3s/kubelet-swap.yaml
+    cat > /etc/rancher/k3s/kubelet-swap.yaml << CONFIG
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
+failSwapOn: false
 memorySwap:
   swapBehavior: LimitedSwap
 CONFIG
 
-    # Restart k3s-agent to apply swap configuration
-    systemctl restart k3s-agent
+    echo "Kubelet swap config created"
+    cat /etc/rancher/k3s/kubelet-swap.yaml
   '
-
-  log_info "Waiting for node to rejoin cluster..."
-  sleep 10
 }
 
 # Create cluster
@@ -193,9 +209,16 @@ cmd_up() {
   TOKEN=$(multipass exec "$SERVER_NAME" -- sudo cat /var/lib/rancher/k3s/server/node-token)
   log_info "Server IP: $SERVER_IP"
 
-  # Install K3s agents
+  # Configure swap on workers BEFORE installing K3s agent
+  # This ensures kubelet starts with proper swap configuration
   for worker in "${WORKER_NAMES[@]}"; do
-    install_k3s_agent "$worker" "$SERVER_IP" "$TOKEN"
+    configure_swap "$worker" "$SWAP_SIZE_MB"
+    prepare_kubelet_swap_config "$worker"
+  done
+
+  # Install K3s agents with swap support
+  for worker in "${WORKER_NAMES[@]}"; do
+    install_k3s_agent "$worker" "$SERVER_IP" "$TOKEN" "true"
   done
 
   # Wait for all nodes
@@ -219,27 +242,6 @@ cmd_up() {
   for worker in "${WORKER_NAMES[@]}"; do
     multipass exec "$SERVER_NAME" -- sudo kubectl label node "$worker" node-role.kubernetes.io/worker=true --overwrite
   done
-
-  # Configure swap on all workers
-  for worker in "${WORKER_NAMES[@]}"; do
-    configure_swap "$worker" "$SWAP_SIZE_MB"
-    configure_kubelet_swap "$worker"
-  done
-
-  # Wait for swap node to be ready again
-  log_info "Waiting for all nodes to be ready after swap configuration..."
-  multipass exec "$SERVER_NAME" -- bash -c '
-    for i in {1..60}; do
-      ready=$(sudo kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo 0)
-      if [ "$ready" -eq 3 ]; then
-        echo "All nodes ready"
-        exit 0
-      fi
-      echo "Waiting... ($ready/3 ready)"
-      sleep 5
-    done
-    exit 1
-  '
 
   log_info "Cluster ready with swap enabled on all workers!"
   echo ""

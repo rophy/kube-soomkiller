@@ -29,7 +29,7 @@ spec:
             - --cooldown-period=30s
             - --psi-threshold=50
             - --poll-interval=1s
-            - --dry-run=true  # Set to false for production
+            - --dry-run=false
             - -v=2
           env:
             - name: NODE_NAME
