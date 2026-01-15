@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"flag"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rophy/kube-soomkiller/internal/controller"
 	"github.com/rophy/kube-soomkiller/internal/metrics"
 	"k8s.io/client-go/kubernetes"
@@ -27,6 +29,7 @@ func main() {
 		psiThreshold      float64
 		cgroupRoot        string
 		dryRun            bool
+		metricsAddr       string
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not set)")
@@ -38,6 +41,7 @@ func main() {
 	flag.Float64Var(&psiThreshold, "psi-threshold", 50.0, "Minimum PSI full avg10 for pod selection")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
 	flag.BoolVar(&dryRun, "dry-run", true, "Log actions without executing")
+	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "Address to serve Prometheus metrics on")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -49,6 +53,32 @@ func main() {
 	klog.Infof("Starting kube-soomkiller on node %s", nodeName)
 	klog.Infof("Config: poll-interval=%s, swap-io-threshold=%d pages/sec, sustained-duration=%s, cooldown-period=%s, psi-threshold=%.1f, dry-run=%v",
 		pollInterval, swapIOThreshold, sustainedDuration, cooldownPeriod, psiThreshold, dryRun)
+
+	// Register Prometheus metrics
+	metrics.RegisterMetrics()
+
+	// Set config metrics
+	metrics.ConfigSwapIOThreshold.Set(float64(swapIOThreshold))
+	metrics.ConfigSustainedDuration.Set(sustainedDuration.Seconds())
+	metrics.ConfigCooldownPeriod.Set(cooldownPeriod.Seconds())
+	if dryRun {
+		metrics.ConfigDryRun.Set(1)
+	} else {
+		metrics.ConfigDryRun.Set(0)
+	}
+
+	// Start metrics server
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+		klog.Infof("Starting metrics server on %s", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
+			klog.Errorf("Metrics server error: %v", err)
+		}
+	}()
 
 	// Create Kubernetes client
 	k8sClient, err := createK8sClient(kubeconfig)

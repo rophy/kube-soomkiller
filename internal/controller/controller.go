@@ -100,21 +100,31 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	klog.V(2).Infof("Swap I/O: pswpin=%d, pswpout=%d, rate=%.1f pages/sec",
 		swapIO.PswpIn, swapIO.PswpOut, swapIORate)
 
+	// Update Prometheus metrics
+	metrics.SwapIORate.Set(swapIORate)
+
 	// Check if in cooldown period
 	if !c.lastKillTime.IsZero() && now.Sub(c.lastKillTime) < c.config.CooldownPeriod {
 		remaining := c.config.CooldownPeriod - now.Sub(c.lastKillTime)
+		metrics.CooldownRemaining.Set(remaining.Seconds())
 		klog.V(2).Infof("In cooldown period, %s remaining", remaining.Round(time.Second))
 		return nil
 	}
+	metrics.CooldownRemaining.Set(0)
 
 	// Check if swap I/O rate exceeds threshold
 	if swapIORate < float64(c.config.SwapIOThreshold) {
 		// Reset threshold exceeded time
 		c.thresholdExceeded = time.Time{}
+		metrics.SwapIOThresholdExceeded.Set(0)
+		metrics.SwapIOThresholdExceededDuration.Set(0)
 		klog.V(2).Infof("Swap I/O rate (%.1f) below threshold (%d), no action needed",
 			swapIORate, c.config.SwapIOThreshold)
 		return nil
 	}
+
+	// Threshold exceeded
+	metrics.SwapIOThresholdExceeded.Set(1)
 
 	// Threshold exceeded - track when it started
 	if c.thresholdExceeded.IsZero() {
@@ -125,6 +135,8 @@ func (c *Controller) reconcile(ctx context.Context) error {
 
 	// Check if sustained long enough
 	sustainedFor := now.Sub(c.thresholdExceeded)
+	metrics.SwapIOThresholdExceededDuration.Set(sustainedFor.Seconds())
+
 	if sustainedFor < c.config.SustainedDuration {
 		klog.Infof("Threshold exceeded for %s (need %s), waiting...",
 			sustainedFor.Round(time.Second), c.config.SustainedDuration)
@@ -138,6 +150,16 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	candidates, err := c.findCandidates(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to find candidates: %w", err)
+	}
+
+	// Update candidate count metric
+	metrics.CandidatePodsCount.Set(float64(len(candidates)))
+
+	// Update per-pod metrics
+	metrics.ResetPodMetrics()
+	for _, cand := range candidates {
+		metrics.PodSwapBytes.WithLabelValues(cand.Namespace, cand.Name).Set(float64(cand.SwapBytes))
+		metrics.PodPSIFullAvg10.WithLabelValues(cand.Namespace, cand.Name).Set(cand.PSIFullAvg10)
 	}
 
 	if len(candidates) == 0 {
@@ -159,6 +181,12 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	// Update state after successful kill
 	c.lastKillTime = now
 	c.thresholdExceeded = time.Time{} // Reset to re-evaluate after cooldown
+
+	// Update Prometheus metrics
+	metrics.PodsKilledTotal.Inc()
+	metrics.LastKillTimestamp.Set(float64(now.Unix()))
+	metrics.SwapIOThresholdExceeded.Set(0)
+	metrics.SwapIOThresholdExceededDuration.Set(0)
 
 	return nil
 }

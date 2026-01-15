@@ -13,6 +13,10 @@ spec:
     metadata:
       labels:
         app: kube-soomkiller
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: kube-soomkiller
       # Only run on worker nodes (which have swap configured)
@@ -36,6 +40,22 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
