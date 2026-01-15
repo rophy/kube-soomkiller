@@ -186,6 +186,32 @@ curl -sfL https://get.k3s.io | \
   sh -
 ```
 
+**Verifying swap is working with kubelet:**
+
+```bash
+# 1. Check kubelet is using the swap config
+cat /etc/systemd/system/k3s-agent.service | grep kubelet-arg
+# Should show: --kubelet-arg=config=/etc/rancher/k3s/kubelet-swap.yaml
+
+# 2. Check swap is active on the node
+free -h
+# Should show non-zero Swap total
+
+# 3. Verify kubelet allows swap (check node conditions)
+kubectl describe node <node-name> | grep -i swap
+# Should NOT show "NodeHasInsufficientSwap" condition
+
+# 4. Deploy a test pod and verify it can use swap
+kubectl run test-swap --image=alpine --restart=Never -- sleep infinity
+kubectl exec test-swap -- cat /proc/self/cgroup
+# Note the cgroup path, then check swap limit:
+# On the node: cat /sys/fs/cgroup/<cgroup-path>/memory.swap.max
+# Should show "max" (unlimited) for Burstable QoS pods with LimitedSwap
+
+# 5. For pods using swap, check current swap usage:
+# On the node: cat /sys/fs/cgroup/<cgroup-path>/memory.swap.current
+```
+
 **Running the stress test:**
 
 ```bash
