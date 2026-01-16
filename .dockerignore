@@ -1,0 +1,25 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+docs/
+*.md
+
+# Build artifacts
+bin/
+coverage.out
+coverage.html
+
+# Deployment and scripts
+deploy/
+scripts/
+
+# Docker and CI files
+Dockerfile*
+docker-compose.yaml
+skaffold.yaml
+Makefile
+
+# License
+LICENSE

@@ -13,7 +13,8 @@ ENV GOTOOLCHAIN=auto
 RUN go mod download
 
 # Copy source code
-COPY . .
+COPY cmd/ cmd/
+COPY internal/ internal/
 
 # Build binary
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o kube-soomkiller ./cmd/kube-soomkiller

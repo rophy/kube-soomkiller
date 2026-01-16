@@ -40,7 +40,7 @@ lint: ## Run linter
 ## Container
 
 image: ## Build container image
-	$(CONTAINER_RUNTIME) build -t $(IMAGE) .
+	./scripts/build-image.sh
 
 push: image ## Push container image
 	$(CONTAINER_RUNTIME) push $(IMAGE)
