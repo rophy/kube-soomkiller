@@ -10,7 +10,9 @@ import (
 	"github.com/rophy/kube-soomkiller/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestSelectVictim(t *testing.T) {
@@ -318,6 +320,40 @@ full avg10=%.2f avg60=1.00 avg300=1.00 total=1000`, psiFullAvg10),
 	}
 }
 
+// Helper to create a fake client that honors spec.nodeName field selector
+func createFakeClientWithNodeFilter(pods ...*corev1.Pod) *fake.Clientset {
+	fakeClient := fake.NewSimpleClientset()
+
+	// Add all pods to the fake client
+	for _, pod := range pods {
+		fakeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	}
+
+	// Add reactor to filter pods by nodeName field selector
+	fakeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+		listAction := action.(k8stesting.ListAction)
+		fieldSelector := listAction.GetListRestrictions().Fields
+
+		// Check for spec.nodeName selector
+		nodeNameReq, found := fieldSelector.RequiresExactMatch("spec.nodeName")
+		if !found {
+			return false, nil, nil // Let default handler process
+		}
+
+		// Filter pods by node name
+		var filtered []corev1.Pod
+		for _, pod := range pods {
+			if pod.Spec.NodeName == nodeNameReq {
+				filtered = append(filtered, *pod)
+			}
+		}
+
+		return true, &corev1.PodList{Items: filtered}, nil
+	})
+
+	return fakeClient
+}
+
 // Helper to create a pod with specific QoS class
 func createPod(name, namespace, nodeName string, qosClass corev1.PodQOSClass, containerID string) *corev1.Pod {
 	return &corev1.Pod{
@@ -340,20 +376,44 @@ func createPod(name, namespace, nodeName string, qosClass corev1.PodQOSClass, co
 	}
 }
 
-func TestCollectCandidates_QoSFiltering(t *testing.T) {
+// Helper to create a pod with multiple containers
+func createPodWithMultipleContainers(name, namespace, nodeName string, qosClass corev1.PodQOSClass, containerIDs []string) *corev1.Pod {
+	var statuses []corev1.ContainerStatus
+	for i, id := range containerIDs {
+		statuses = append(statuses, corev1.ContainerStatus{
+			Name:        fmt.Sprintf("container-%d", i),
+			ContainerID: "containerd://" + id,
+		})
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+		},
+		Status: corev1.PodStatus{
+			QOSClass:          qosClass,
+			ContainerStatuses: statuses,
+		},
+	}
+}
+
+func TestFindCandidates_QoSFiltering(t *testing.T) {
 	tmpDir := t.TempDir()
 	nodeName := "test-node"
 
-	// Create cgroups for each pod
 	// Container IDs (first 12 chars used for matching)
 	burstableContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
 	guaranteedContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
 	bestEffortContainerID := "ccc111222333444555666777888999000111222333444555666777888999000111"
 
-	// Create cgroups with swap usage and PSI
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/cri-containerd-"+burstableContainerID+".scope", 100<<20, 5.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-guaranteed.slice/cri-containerd-"+guaranteedContainerID+".scope", 100<<20, 5.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-besteffort.slice/cri-containerd-"+bestEffortContainerID+".scope", 100<<20, 5.0)
+	// Create cgroups with realistic kubelet path structure
+	// Format: kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice/cri-containerd-<id>.scope
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+burstableContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-guaranteed.slice/kubepods-guaranteed-podbbb.slice/cri-containerd-"+guaranteedContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podccc.slice/cri-containerd-"+bestEffortContainerID+".scope", 100<<20, 5.0)
 
 	// Create fake K8s client with pods of different QoS classes
 	fakeClient := fake.NewSimpleClientset(
@@ -389,7 +449,7 @@ func TestCollectCandidates_QoSFiltering(t *testing.T) {
 	}
 }
 
-func TestCollectCandidates_SwapZeroFiltering(t *testing.T) {
+func TestFindCandidates_SwapZeroFiltering(t *testing.T) {
 	tmpDir := t.TempDir()
 	nodeName := "test-node"
 
@@ -397,9 +457,9 @@ func TestCollectCandidates_SwapZeroFiltering(t *testing.T) {
 	withSwapContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
 	noSwapContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
 
-	// Create cgroups - one with swap, one without
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/cri-containerd-"+withSwapContainerID+".scope", 100<<20, 5.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/cri-containerd-"+noSwapContainerID+".scope", 0, 5.0) // swap=0
+	// Create cgroups with realistic path structure - one with swap, one without
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+withSwapContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podbbb.slice/cri-containerd-"+noSwapContainerID+".scope", 0, 5.0) // swap=0
 
 	// Create fake K8s client - both pods are Burstable
 	fakeClient := fake.NewSimpleClientset(
@@ -434,11 +494,15 @@ func TestCollectCandidates_SwapZeroFiltering(t *testing.T) {
 	}
 }
 
-func TestCollectCandidates_NoCandidates(t *testing.T) {
+func TestFindCandidates_NoCandidates(t *testing.T) {
 	tmpDir := t.TempDir()
 	nodeName := "test-node"
 
-	// No cgroups created - empty filesystem
+	// Create empty kubepods.slice directory (no container cgroups)
+	kubepodsPath := filepath.Join(tmpDir, "kubepods.slice")
+	if err := os.MkdirAll(kubepodsPath, 0755); err != nil {
+		t.Fatalf("Failed to create kubepods.slice: %v", err)
+	}
 
 	// Create fake K8s client with a Burstable pod but no matching cgroup
 	containerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
@@ -461,6 +525,93 @@ func TestCollectCandidates_NoCandidates(t *testing.T) {
 
 	if len(candidates) != 0 {
 		t.Errorf("findCandidates() returned %d candidates, want 0", len(candidates))
+	}
+}
+
+func TestFindCandidates_PodOnDifferentNode(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// Container ID for pod on different node
+	containerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+
+	// Create cgroup with swap usage (as if the container were on this node)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+containerID+".scope", 100<<20, 5.0)
+
+	// Create fake K8s client with pod on DIFFERENT node
+	// Use helper that honors spec.nodeName field selector
+	fakeClient := createFakeClientWithNodeFilter(
+		createPod("remote-pod", "default", "other-node", corev1.PodQOSBurstable, containerID),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:  nodeName, // Controller is on test-node
+			K8sClient: fakeClient,
+			Metrics:   metrics.NewCollector(tmpDir),
+		},
+	}
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	// Pod on different node should not be a candidate
+	if len(candidates) != 0 {
+		t.Errorf("findCandidates() returned %d candidates, want 0 (pod on different node)", len(candidates))
+	}
+}
+
+func TestFindCandidates_MultipleContainersInPod(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// Two containers in the same pod
+	container1ID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+	container2ID := "bbb111222333444555666777888999000111222333444555666777888999000111"
+
+	// Create cgroups for both containers with different swap and PSI values
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+container1ID+".scope", 50<<20, 3.0)  // 50MB swap, PSI=3
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+container2ID+".scope", 100<<20, 8.0) // 100MB swap, PSI=8
+
+	// Create fake K8s client with pod having two containers
+	fakeClient := fake.NewSimpleClientset(
+		createPodWithMultipleContainers("multi-container-pod", "default", nodeName, corev1.PodQOSBurstable, []string{container1ID, container2ID}),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:  nodeName,
+			K8sClient: fakeClient,
+			Metrics:   metrics.NewCollector(tmpDir),
+		},
+	}
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	// Should return one candidate with aggregated metrics
+	if len(candidates) != 1 {
+		t.Fatalf("findCandidates() returned %d candidates, want 1", len(candidates))
+	}
+
+	cand := candidates[0]
+	if cand.Name != "multi-container-pod" {
+		t.Errorf("candidate name = %s, want multi-container-pod", cand.Name)
+	}
+
+	// Swap should be aggregated (50MB + 100MB = 150MB)
+	expectedSwap := int64(150 << 20)
+	if cand.SwapBytes != expectedSwap {
+		t.Errorf("candidate SwapBytes = %d, want %d (aggregated)", cand.SwapBytes, expectedSwap)
+	}
+
+	// PSI should be the max of both containers (max(3.0, 8.0) = 8.0)
+	if cand.PSIFullAvg10 != 8.0 {
+		t.Errorf("candidate PSIFullAvg10 = %.2f, want 8.0 (max)", cand.PSIFullAvg10)
 	}
 }
 
@@ -527,5 +678,28 @@ func TestTerminatePod_ActualDelete(t *testing.T) {
 	_, err = fakeClient.CoreV1().Pods("default").Get(context.Background(), "test-pod", metav1.GetOptions{})
 	if err == nil {
 		t.Errorf("pod still exists after terminatePod(), should have been deleted")
+	}
+}
+
+func TestTerminatePod_NonExistent(t *testing.T) {
+	// Create fake client with NO pods
+	fakeClient := fake.NewSimpleClientset()
+
+	c := &Controller{
+		config: Config{
+			DryRun:    false,
+			K8sClient: fakeClient,
+		},
+	}
+
+	// Try to terminate a pod that doesn't exist
+	err := c.terminatePod(context.Background(), PodCandidate{
+		Namespace: "default",
+		Name:      "nonexistent-pod",
+	})
+
+	// Should return an error
+	if err == nil {
+		t.Errorf("terminatePod() should return error for non-existent pod")
 	}
 }
