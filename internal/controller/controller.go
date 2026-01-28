@@ -35,6 +35,11 @@ type Controller struct {
 	lastSampleTime    time.Time
 	thresholdExceeded time.Time // when threshold was first exceeded
 	lastKillTime      time.Time // when we last killed a pod
+
+	// Logging state (to reduce log frequency)
+	lastStatusLogTime time.Time
+	lastLoggedRate    float64
+	lastRateAbove     bool // was rate above threshold on last check
 }
 
 // PodCandidate represents a pod that may be terminated
@@ -51,6 +56,33 @@ func New(config Config) *Controller {
 	return &Controller{
 		config: config,
 	}
+}
+
+// shouldLogStatus returns true if we should log the current status.
+// Logs every 30s, or when rate crosses threshold, or changes significantly (>50%).
+func (c *Controller) shouldLogStatus(rate float64, now time.Time) bool {
+	threshold := float64(c.config.SwapIOThreshold)
+	rateAbove := rate >= threshold
+
+	// Always log if threshold crossing changed
+	if rateAbove != c.lastRateAbove {
+		return true
+	}
+
+	// Log if rate changed significantly (>50% relative change)
+	if c.lastLoggedRate > 0 {
+		change := (rate - c.lastLoggedRate) / c.lastLoggedRate
+		if change > 0.5 || change < -0.5 {
+			return true
+		}
+	}
+
+	// Log every 30 seconds
+	if now.Sub(c.lastStatusLogTime) >= 30*time.Second {
+		return true
+	}
+
+	return false
 }
 
 // Run starts the controller main loop
@@ -98,17 +130,24 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	c.lastSwapIO = swapIO
 	c.lastSampleTime = now
 
-	klog.V(2).Infof("Swap I/O: pswpin=%d, pswpout=%d, rate=%.1f pages/sec",
-		swapIO.PswpIn, swapIO.PswpOut, swapIORate)
-
 	// Update Prometheus metrics
 	metrics.SwapIORate.Set(swapIORate)
+
+	// Determine if we should log status (every 30s, or on significant change)
+	rateAbove := swapIORate >= float64(c.config.SwapIOThreshold)
+	shouldLog := c.shouldLogStatus(swapIORate, now)
 
 	// Check if in cooldown period
 	if !c.lastKillTime.IsZero() && now.Sub(c.lastKillTime) < c.config.CooldownPeriod {
 		remaining := c.config.CooldownPeriod - now.Sub(c.lastKillTime)
 		metrics.CooldownRemaining.Set(remaining.Seconds())
-		klog.V(2).Infof("In cooldown period, %s remaining", remaining.Round(time.Second))
+		if shouldLog {
+			klog.V(2).Infof("Swap I/O rate=%.1f pages/sec, in cooldown (%s remaining)",
+				swapIORate, remaining.Round(time.Second))
+			c.lastStatusLogTime = now
+			c.lastLoggedRate = swapIORate
+			c.lastRateAbove = rateAbove
+		}
 		return nil
 	}
 	metrics.CooldownRemaining.Set(0)
@@ -119,8 +158,13 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		c.thresholdExceeded = time.Time{}
 		metrics.SwapIOThresholdExceeded.Set(0)
 		metrics.SwapIOThresholdExceededDuration.Set(0)
-		klog.V(2).Infof("Swap I/O rate (%.1f) below threshold (%d), no action needed",
-			swapIORate, c.config.SwapIOThreshold)
+		if shouldLog {
+			klog.V(2).Infof("Swap I/O rate=%.1f pages/sec (threshold=%d), idle",
+				swapIORate, c.config.SwapIOThreshold)
+			c.lastStatusLogTime = now
+			c.lastLoggedRate = swapIORate
+			c.lastRateAbove = rateAbove
+		}
 		return nil
 	}
 
