@@ -196,11 +196,12 @@ deploy_with_threshold() {
     wait_for_daemonset kube-soomkiller
 }
 
-# Redeploy soomkiller in dry-run mode
-deploy_dry_run() {
-    kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--dry-run=true"}]'
-    wait_for_daemonset kube-soomkiller
+# Set dry-run mode via env var
+# Usage: set_dry_run true|false
+set_dry_run() {
+    local enabled="${1:-true}"
+    kubectl set env daemonset/kube-soomkiller -n "$NAMESPACE" DRY_RUN="$enabled"
+    wait_for_daemonset kube-soomkiller 120
 }
 
 # Get worker node name

@@ -4,10 +4,13 @@
 setup() {
     load 'test_helper'
     cleanup_stress_pods
+    # Use dry-run mode - we only need to verify filtering logic
+    set_dry_run true
 }
 
 teardown() {
     cleanup_stress_pods
+    set_dry_run false
 }
 
 @test "only Burstable QoS pods are candidates" {

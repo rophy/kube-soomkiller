@@ -4,6 +4,8 @@
 setup() {
     load 'test_helper'
     cleanup_stress_pods
+    # Disable dry-run - these tests verify actual behavior
+    set_dry_run false
 }
 
 teardown() {
@@ -16,7 +18,7 @@ teardown() {
 
     # Patch daemonset to use lower threshold for testing
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=100"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=100", "-v=2"]}]'
     wait_for_daemonset kube-soomkiller 120
 
     # Run sysbench to create swap pressure
@@ -36,7 +38,7 @@ teardown() {
 
     # Restore original threshold
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=1000"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=1000", "-v=2"]}]'
 
     # Test passes if threshold was exceeded or victim was selected
     if echo "$logs" | grep -q "Swap I/O threshold exceeded"; then
@@ -55,7 +57,7 @@ teardown() {
 @test "sustained duration required before action (10s)" {
     # Patch daemonset to use lower threshold and short sustained duration
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=50", "--sustained-duration=10s"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=50", "--sustained-duration=10s", "-v=2"]}]'
     wait_for_daemonset kube-soomkiller 120
 
     # Run brief sysbench (only 5 seconds - less than sustained duration)
@@ -67,7 +69,7 @@ teardown() {
 
     # Restore original settings
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=1000"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=1000", "-v=2"]}]'
 
     # Should see "waiting" message indicating sustained duration not met
     # OR should NOT see victim selection (brief spike ignored)
@@ -87,7 +89,7 @@ teardown() {
 @test "pod with highest PSI is selected as victim" {
     # Patch to very low threshold to ensure trigger
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=50"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=50", "-v=2"]}]'
     wait_for_daemonset kube-soomkiller 120
 
     # Run sysbench - this stresses mariadb which should have highest PSI
@@ -107,7 +109,7 @@ teardown() {
 
     # Restore
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=1000"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=1000", "-v=2"]}]'
 
     # If victim was selected, verify it was mariadb
     if echo "$logs" | grep -q "Selected victim:"; then
@@ -137,7 +139,7 @@ teardown() {
 @test "cooldown period prevents rapid kills" {
     # Patch to lower threshold and short cooldown for testing
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=100", "--cooldown-period=30s"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=100", "--cooldown-period=30s", "-v=2"]}]'
     wait_for_daemonset kube-soomkiller 120
 
     # Run sysbench to trigger kill
@@ -156,7 +158,7 @@ teardown() {
 
     # Restore
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=1000"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=1000", "-v=2"]}]'
 
     # If a pod was deleted, must see cooldown messages
     if echo "$logs" | grep -q "Successfully deleted pod"; then

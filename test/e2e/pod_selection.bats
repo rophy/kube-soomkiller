@@ -4,10 +4,13 @@
 setup() {
     load 'test_helper'
     cleanup_stress_pods
+    # Use dry-run mode - we only need to verify selection logic
+    set_dry_run true
 }
 
 teardown() {
     cleanup_stress_pods
+    set_dry_run false
 }
 
 @test "pods with swap=0 are not selected as victims" {
@@ -41,7 +44,7 @@ EOF
 
     # Lower threshold and trigger activity
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=100"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=100", "-v=2"]}]'
     wait_for_daemonset kube-soomkiller 120
 
     # Run brief sysbench
@@ -56,7 +59,7 @@ EOF
 
     # Restore
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=1000"]}]'
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=1000", "-v=2"]}]'
 
     # no-swap-pod should NOT be selected as victim (swap=0)
     if echo "$logs" | grep -q "Selected victim:.*no-swap-pod"; then
@@ -111,7 +114,7 @@ EOF
 
     # Restore default settings (in case previous test changed them)
     kubectl patch daemonset kube-soomkiller -n "$NAMESPACE" --type=json \
-        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--node-name=$(NODE_NAME)", "--swap-io-threshold=1000"]}]' 2>/dev/null || true
+        -p '[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["--swap-io-threshold=1000", "-v=2"]}]' 2>/dev/null || true
 
     # Wait for system to stabilize (logs accumulate over 30s intervals)
     sleep 35

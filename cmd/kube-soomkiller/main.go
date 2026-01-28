@@ -38,7 +38,7 @@ func main() {
 	flag.DurationVar(&sustainedDuration, "sustained-duration", 10*time.Second, "How long threshold must be exceeded before action")
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 30*time.Second, "Wait time after killing a pod")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
-	flag.BoolVar(&dryRun, "dry-run", true, "Log actions without executing")
+	flag.BoolVar(&dryRun, "dry-run", getEnvBool("DRY_RUN", true), "Log actions without executing")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "Address to serve Prometheus metrics on")
 
 	klog.InitFlags(nil)
@@ -140,4 +140,11 @@ func createK8sClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	}
 
 	return kubernetes.NewForConfig(config)
+}
+
+func getEnvBool(key string, defaultVal bool) bool {
+	if val := os.Getenv(key); val != "" {
+		return val == "true" || val == "1"
+	}
+	return defaultVal
 }

@@ -32,29 +32,27 @@ This machine is shared. Before launching any VM (multipass, etc.), ALWAYS:
 
 ### Running Tests
 
-Run all tests:
+Run all tests (with suite setup):
 ```bash
-bats test/e2e/*.bats
+bats test/e2e/
 ```
 
-Run a specific test file:
+Run a specific test file (skips suite setup):
 ```bash
 bats test/e2e/core_functionality.bats
 ```
 
 Run tests matching a pattern:
 ```bash
-bats --filter "threshold" test/e2e/*.bats
+bats --filter "threshold" test/e2e/
 ```
 
 ### Test Setup
 
-The test runner (`test/e2e/run_tests.sh`) handles full setup:
-```bash
-./test/e2e/run_tests.sh
-```
-
-This deploys kube-soomkiller via skaffold and prepares the sysbench database.
+The `setup_suite.bash` file handles one-time setup automatically when running `bats test/e2e/`:
+- Deploys kube-soomkiller via skaffold
+- Waits for daemonset rollout
+- Prepares sysbench database
 
 ### Manual Stress Testing
 

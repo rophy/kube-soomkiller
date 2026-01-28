@@ -239,6 +239,22 @@ kubectl logs -n kube-soomkiller daemonset/kube-soomkiller -f
 
 When swap I/O exceeds 1000 pages/sec for 10 seconds, soomkiller will terminate the MariaDB pod gracefully.
 
+**Running automated e2e tests:**
+
+```bash
+# Prerequisites: bats (apt install bats)
+# Requires: K3s cluster running with context 'k3s'
+
+# Run all e2e tests (includes suite setup)
+bats test/e2e/
+
+# Run specific test file (skips suite setup)
+bats test/e2e/core_functionality.bats
+
+# Run with custom context
+KUBE_CONTEXT=minikube bats test/e2e/
+```
+
 ## Problem Statement
 
 When a pod exceeds its memory limit, the Linux kernel's OOM killer sends SIGKILL - an immediate, uninterruptible termination. This causes:
