@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rophy/kube-soomkiller/internal/controller"
+	"github.com/rophy/kube-soomkiller/internal/cri"
 	"github.com/rophy/kube-soomkiller/internal/metrics"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -28,6 +29,7 @@ func main() {
 		cooldownPeriod    time.Duration
 		psiThreshold      float64
 		cgroupRoot        string
+		crictl            string
 		dryRun            bool
 		metricsAddr       string
 	)
@@ -40,6 +42,7 @@ func main() {
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 30*time.Second, "Wait time after killing a pod")
 	flag.Float64Var(&psiThreshold, "psi-threshold", 50.0, "Minimum PSI full avg10 for pod selection")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
+	flag.StringVar(&crictl, "crictl", "crictl", "Path to crictl binary")
 	flag.BoolVar(&dryRun, "dry-run", true, "Log actions without executing")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "Address to serve Prometheus metrics on")
 
@@ -89,6 +92,9 @@ func main() {
 	// Create metrics collector
 	metricsCollector := metrics.NewCollector(cgroupRoot)
 
+	// Create CRI client
+	criClient := cri.NewClient(crictl)
+
 	// Create controller
 	ctrl := controller.New(controller.Config{
 		NodeName:          nodeName,
@@ -100,6 +106,8 @@ func main() {
 		DryRun:            dryRun,
 		K8sClient:         k8sClient,
 		Metrics:           metricsCollector,
+		CRIClient:         criClient,
+		CgroupRoot:        cgroupRoot,
 	})
 
 	// Handle shutdown gracefully

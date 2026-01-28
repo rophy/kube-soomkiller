@@ -171,33 +171,6 @@ func (c *Collector) readPSI(path string) (*PSI, error) {
 	return psi, scanner.Err()
 }
 
-// FindPodCgroups finds all pod cgroup paths on the node
-func (c *Collector) FindPodCgroups() ([]string, error) {
-	var cgroups []string
-
-	kubepodPath := filepath.Join(c.cgroupRoot, "kubepods.slice")
-	if _, err := os.Stat(kubepodPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("kubepods.slice not found at %s", kubepodPath)
-	}
-
-	// Walk through kubepods hierarchy to find container cgroups
-	err := filepath.Walk(kubepodPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-
-		// Look for cri-containerd-* directories (container cgroups)
-		if info.IsDir() && strings.HasPrefix(info.Name(), "cri-containerd-") {
-			relPath, _ := filepath.Rel(c.cgroupRoot, path)
-			cgroups = append(cgroups, relPath)
-		}
-
-		return nil
-	})
-
-	return cgroups, err
-}
-
 func readInt64File(path string) (int64, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
