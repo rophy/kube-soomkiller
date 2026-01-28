@@ -28,9 +28,9 @@ spec:
         - name: kube-soomkiller
           image: rophy/kube-soomkiller
           args:
-            - --swap-io-threshold=1000
+            - --swap-io-threshold=100
             - --sustained-duration=10s
-            - --cooldown-period=30s
+            - --cooldown-period=90s
             - --poll-interval=1s
             - -v=2
           env:

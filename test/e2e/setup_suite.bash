@@ -14,6 +14,11 @@ setup_suite() {
     kubectl --context "${KUBE_CONTEXT:-k3s}" rollout status daemonset/kube-soomkiller \
         -n kube-soomkiller --timeout=120s
 
+    # Wait for mariadb pods to be ready
+    echo "# Waiting for mariadb pods..."
+    kubectl --context "${KUBE_CONTEXT:-k3s}" -n kube-soomkiller wait --for=condition=ready \
+        pod -l app=mariadb --timeout=120s
+
     # Prepare sysbench (idempotent)
     echo "# Preparing sysbench tables..."
     source "$(dirname "$BATS_TEST_FILENAME")/test_helper.bash"

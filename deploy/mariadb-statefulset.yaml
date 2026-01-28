@@ -6,7 +6,7 @@ metadata:
     app: mariadb
 spec:
   serviceName: mariadb
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: mariadb
@@ -16,12 +16,10 @@ spec:
         app: mariadb
     spec:
       nodeSelector:
-        node-role.kubernetes.io/worker: "true"
+        kubernetes.io/hostname: k3s-worker2
       containers:
       - name: mariadb
         image: mariadb:11
-        args:
-        - --innodb-buffer-pool-size=256M
         env:
         - name: MARIADB_ROOT_PASSWORD
           value: "testpass"
@@ -35,3 +33,10 @@ spec:
         ports:
         - containerPort: 3306
           name: mysql
+        volumeMounts:
+        - name: mariadb-config
+          mountPath: /etc/mysql/conf.d
+      volumes:
+      - name: mariadb-config
+        configMap:
+          name: mariadb-config

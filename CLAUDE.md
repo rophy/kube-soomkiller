@@ -27,6 +27,7 @@ This machine is shared. Before launching any VM (multipass, etc.), ALWAYS:
 
 ### Prerequisites
 - BATS installed (`apt install bats`)
+- stern installed (`go install github.com/stern/stern@latest`)
 - K3s cluster running with swap enabled
 - kubectl context set to `k3s`
 
