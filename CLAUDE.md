@@ -25,4 +25,37 @@ This machine is shared. Before launching any VM (multipass, etc.), ALWAYS:
 
 ## E2E Testing
 
+### Prerequisites
+- BATS installed (`apt install bats`)
+- K3s cluster running with swap enabled
+- kubectl context set to `k3s`
+
+### Running Tests
+
+Run all tests:
+```bash
+bats test/e2e/*.bats
+```
+
+Run a specific test file:
+```bash
+bats test/e2e/core_functionality.bats
+```
+
+Run tests matching a pattern:
+```bash
+bats --filter "threshold" test/e2e/*.bats
+```
+
+### Test Setup
+
+The test runner (`test/e2e/run_tests.sh`) handles full setup:
+```bash
+./test/e2e/run_tests.sh
+```
+
+This deploys kube-soomkiller via skaffold and prepares the sysbench database.
+
+### Manual Stress Testing
+
 Follow the instructions in README.md for how to deploy and perform stress test.
