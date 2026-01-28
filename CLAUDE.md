@@ -22,3 +22,7 @@ This machine is shared. Before launching any VM (multipass, etc.), ALWAYS:
    - Do NOT automatically delete VMs - other users may be using them
    - Inform the user of current memory status and what is needed
    - Let the user decide how to proceed
+
+## E2E Testing
+
+Follow the instructions in README.md for how to deploy and perform stress test.
