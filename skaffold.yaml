@@ -4,14 +4,14 @@ metadata:
   name: kube-soomkiller
 build:
   artifacts:
-    - image: ttl.sh/kube-soomkiller
+    - image: rophy/kube-soomkiller
       context: .
       docker:
         dockerfile: Dockerfile
   local:
     push: true
   tagPolicy:
-    sha256: {}
+    gitCommit: {}
 manifests:
   kustomize:
     paths:
