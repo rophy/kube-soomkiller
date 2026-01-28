@@ -1,7 +1,5 @@
 # Build stage
-FROM docker.io/golang:1.24-alpine AS builder
-
-RUN apk add --no-cache git
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -19,9 +17,9 @@ COPY internal/ internal/
 # Build binary
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o kube-soomkiller ./cmd/kube-soomkiller
 
-# Runtime stage
-FROM docker.io/alpine:3.21
+# Runtime stage - distroless for minimal attack surface
+FROM gcr.io/distroless/static:nonroot
 
-COPY --from=builder /app/kube-soomkiller /usr/local/bin/kube-soomkiller
+COPY --from=builder /app/kube-soomkiller /kube-soomkiller
 
-ENTRYPOINT ["/usr/local/bin/kube-soomkiller"]
+ENTRYPOINT ["/kube-soomkiller"]
