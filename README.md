@@ -43,7 +43,6 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 |------|---------|-------------|
 | `--swap-io-threshold` | 1000 | Swap I/O rate (pages/sec) to trigger action |
 | `--sustained-duration` | 10s | How long threshold must be exceeded |
-| `--psi-threshold` | 50 | Minimum PSI full avg10 for pod selection |
 | `--poll-interval` | 1s | How often to sample /proc/vmstat |
 | `--cooldown-period` | 30s | Wait time after killing a pod |
 | `--dry-run` | true | Log actions without executing |
@@ -274,7 +273,7 @@ Monitor node-level swap I/O and proactively terminate pods under memory pressure
 │            │               └─────────────────────────────┘  │
 │            │                                                │
 │            │ Select victim:                                 │
-│            │   where swap_usage > 0                         │
+│            │   where swap_usage > 0 AND psi > 0             │
 │            │   max by psi_full_avg10                        │
 │            ▼                                                │
 │   ┌─────────────────┐                                       │
@@ -314,13 +313,14 @@ When swap I/O exceeds the threshold for a sustained period, the node is under me
 ### 3. Pod Selection
 
 ```
-candidate_pods = pods where (swap_usage > 0)
+candidate_pods = pods where (swap_usage > 0 AND psi_full_avg10 > 0)
 victim = max(candidate_pods, key=psi_full_avg10)
 ```
 
 Select the pod with:
 1. Non-zero swap usage (actively using swap)
-2. Highest PSI `full` value (most severe memory stalls)
+2. Non-zero PSI (experiencing memory pressure)
+3. Highest PSI `full` value among candidates (most severe memory stalls)
 
 ### 4. Graceful Termination
 

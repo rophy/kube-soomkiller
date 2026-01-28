@@ -10,9 +10,10 @@ func TestSelectVictim(t *testing.T) {
 		candidates []PodCandidate
 		wantPod    string
 		wantNS     string
+		wantNil    bool
 	}{
 		{
-			name: "single candidate",
+			name: "single candidate with PSI > 0",
 			candidates: []PodCandidate{
 				{Namespace: "default", Name: "only-pod", PSIFullAvg10: 5.0, SwapBytes: 100 * 1024 * 1024},
 			},
@@ -39,23 +40,31 @@ func TestSelectVictim(t *testing.T) {
 			wantPod: "small-swap-high-psi",
 		},
 		{
-			name: "equal PSI selects first in original order",
+			name: "equal PSI uses swap as tiebreaker",
 			candidates: []PodCandidate{
 				{Namespace: "ns-a", Name: "pod-a", PSIFullAvg10: 5.0, SwapBytes: 100 << 20},
-				{Namespace: "ns-b", Name: "pod-b", PSIFullAvg10: 5.0, SwapBytes: 100 << 20},
-				{Namespace: "ns-c", Name: "pod-c", PSIFullAvg10: 5.0, SwapBytes: 100 << 20},
+				{Namespace: "ns-b", Name: "pod-b", PSIFullAvg10: 5.0, SwapBytes: 200 << 20},
+				{Namespace: "ns-c", Name: "pod-c", PSIFullAvg10: 5.0, SwapBytes: 150 << 20},
 			},
-			wantNS:  "ns-a",
-			wantPod: "pod-a",
+			wantNS:  "ns-b",
+			wantPod: "pod-b", // highest swap when PSI is equal
 		},
 		{
-			name: "zero PSI values",
+			name: "all candidates have PSI = 0 returns nil",
 			candidates: []PodCandidate{
 				{Namespace: "default", Name: "zero-psi-1", PSIFullAvg10: 0.0, SwapBytes: 100 << 20},
 				{Namespace: "default", Name: "zero-psi-2", PSIFullAvg10: 0.0, SwapBytes: 200 << 20},
 			},
+			wantNil: true,
+		},
+		{
+			name: "filters out PSI = 0 candidates",
+			candidates: []PodCandidate{
+				{Namespace: "default", Name: "zero-psi", PSIFullAvg10: 0.0, SwapBytes: 500 << 20},
+				{Namespace: "default", Name: "has-psi", PSIFullAvg10: 1.0, SwapBytes: 50 << 20},
+			},
 			wantNS:  "default",
-			wantPod: "zero-psi-1",
+			wantPod: "has-psi",
 		},
 		{
 			name: "very small PSI differences",
@@ -77,14 +86,14 @@ func TestSelectVictim(t *testing.T) {
 			wantPod: "test-pod",
 		},
 		{
-			name: "large candidate list",
+			name: "large candidate list with mixed PSI",
 			candidates: func() []PodCandidate {
 				candidates := make([]PodCandidate, 100)
 				for i := 0; i < 100; i++ {
 					candidates[i] = PodCandidate{
 						Namespace:    "default",
 						Name:         "pod-" + string(rune('a'+i%26)) + string(rune('0'+i/26)),
-						PSIFullAvg10: float64(i),
+						PSIFullAvg10: float64(i), // pod-a0 has PSI=0, filtered out
 						SwapBytes:    int64(i << 20),
 					}
 				}
@@ -106,6 +115,16 @@ func TestSelectVictim(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &Controller{}
 			got := c.selectVictim(tt.candidates)
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("selectVictim() = %s/%s, want nil", got.Namespace, got.Name)
+				}
+				return
+			}
+			if got == nil {
+				t.Errorf("selectVictim() = nil, want %s/%s", tt.wantNS, tt.wantPod)
+				return
+			}
 			if got.Namespace != tt.wantNS || got.Name != tt.wantPod {
 				t.Errorf("selectVictim() = %s/%s, want %s/%s",
 					got.Namespace, got.Name, tt.wantNS, tt.wantPod)
@@ -125,7 +144,7 @@ func TestSelectVictimStability(t *testing.T) {
 	c := &Controller{}
 
 	// Run multiple times to verify deterministic behavior
-	var firstResult PodCandidate
+	var firstResult *PodCandidate
 	for i := 0; i < 100; i++ {
 		// Make a copy to avoid sort affecting original
 		candidatesCopy := make([]PodCandidate, len(candidates))
@@ -140,6 +159,25 @@ func TestSelectVictimStability(t *testing.T) {
 					i, result.Namespace, result.Name, firstResult.Namespace, firstResult.Name)
 			}
 		}
+	}
+}
+
+func TestSelectVictimSwapTiebreaker(t *testing.T) {
+	// When PSI values are equal, swap should be used as tiebreaker
+	candidates := []PodCandidate{
+		{Namespace: "default", Name: "small-swap", PSIFullAvg10: 5.0, SwapBytes: 50 << 20},
+		{Namespace: "default", Name: "large-swap", PSIFullAvg10: 5.0, SwapBytes: 200 << 20},
+		{Namespace: "default", Name: "medium-swap", PSIFullAvg10: 5.0, SwapBytes: 100 << 20},
+	}
+
+	c := &Controller{}
+
+	result := c.selectVictim(candidates)
+	if result == nil {
+		t.Fatal("selectVictim() returned nil")
+	}
+	if result.Name != "large-swap" {
+		t.Errorf("selectVictim() = %s, want large-swap (highest swap when PSI equal)", result.Name)
 	}
 }
 
@@ -248,4 +286,3 @@ func TestExtractContainerIDFromStatus(t *testing.T) {
 		})
 	}
 }
-

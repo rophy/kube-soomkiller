@@ -31,7 +31,6 @@ spec:
             - --swap-io-threshold=1000
             - --sustained-duration=10s
             - --cooldown-period=30s
-            - --psi-threshold=50
             - --poll-interval=1s
             - --dry-run=false
             - -v=2

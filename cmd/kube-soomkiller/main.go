@@ -26,7 +26,6 @@ func main() {
 		swapIOThreshold   int
 		sustainedDuration time.Duration
 		cooldownPeriod    time.Duration
-		psiThreshold      float64
 		cgroupRoot        string
 		dryRun            bool
 		metricsAddr       string
@@ -38,7 +37,6 @@ func main() {
 	flag.IntVar(&swapIOThreshold, "swap-io-threshold", 1000, "Swap I/O rate (pages/sec) to trigger action")
 	flag.DurationVar(&sustainedDuration, "sustained-duration", 10*time.Second, "How long threshold must be exceeded before action")
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 30*time.Second, "Wait time after killing a pod")
-	flag.Float64Var(&psiThreshold, "psi-threshold", 50.0, "Minimum PSI full avg10 for pod selection")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
 	flag.BoolVar(&dryRun, "dry-run", true, "Log actions without executing")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "Address to serve Prometheus metrics on")
@@ -51,8 +49,8 @@ func main() {
 	}
 
 	klog.Infof("Starting kube-soomkiller on node %s", nodeName)
-	klog.Infof("Config: poll-interval=%s, swap-io-threshold=%d pages/sec, sustained-duration=%s, cooldown-period=%s, psi-threshold=%.1f, dry-run=%v",
-		pollInterval, swapIOThreshold, sustainedDuration, cooldownPeriod, psiThreshold, dryRun)
+	klog.Infof("Config: poll-interval=%s, swap-io-threshold=%d pages/sec, sustained-duration=%s, cooldown-period=%s, dry-run=%v",
+		pollInterval, swapIOThreshold, sustainedDuration, cooldownPeriod, dryRun)
 
 	// Register Prometheus metrics
 	metrics.RegisterMetrics()
@@ -102,7 +100,6 @@ func main() {
 		SwapIOThreshold:   swapIOThreshold,
 		SustainedDuration: sustainedDuration,
 		CooldownPeriod:    cooldownPeriod,
-		PSIThreshold:      psiThreshold,
 		DryRun:            dryRun,
 		K8sClient:         k8sClient,
 		Metrics:           metricsCollector,

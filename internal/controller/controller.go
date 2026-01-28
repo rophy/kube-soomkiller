@@ -21,7 +21,6 @@ type Config struct {
 	SwapIOThreshold   int           // pages/sec to trigger action
 	SustainedDuration time.Duration // how long threshold must be exceeded
 	CooldownPeriod    time.Duration // wait time after killing a pod
-	PSIThreshold      float64       // minimum PSI for pod selection
 	DryRun            bool
 	K8sClient         *kubernetes.Clientset
 	Metrics           *metrics.Collector
@@ -169,14 +168,18 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		return nil
 	}
 
-	// Select victim (highest PSI full avg10 among swap users)
+	// Select victim (highest PSI full avg10 among swap users, with swap as tiebreaker)
 	victim := c.selectVictim(candidates)
+	if victim == nil {
+		klog.Warning("Swap I/O is high but no pods have both swap > 0 and PSI > 0")
+		return nil
+	}
 
 	klog.Warningf("Selected victim: %s/%s (swap=%d MB, PSI full avg10=%.2f)",
 		victim.Namespace, victim.Name, victim.SwapBytes/1024/1024, victim.PSIFullAvg10)
 
 	// Terminate the pod
-	if err := c.terminatePod(ctx, victim); err != nil {
+	if err := c.terminatePod(ctx, *victim); err != nil {
 		return fmt.Errorf("failed to terminate pod: %w", err)
 	}
 
@@ -342,20 +345,40 @@ func extractContainerIDFromCgroup(cgroupPath string) string {
 	return fullID
 }
 
-func (c *Controller) selectVictim(candidates []PodCandidate) PodCandidate {
-	// Sort by PSI full avg10 (descending)
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].PSIFullAvg10 > candidates[j].PSIFullAvg10
-	})
-
-	// Log all candidates
-	klog.Infof("Candidates for termination (%d total):", len(candidates))
-	for i, cand := range candidates {
-		klog.Infof("  %d. %s/%s: swap=%d MB, PSI=%.2f",
-			i+1, cand.Namespace, cand.Name, cand.SwapBytes/1024/1024, cand.PSIFullAvg10)
+func (c *Controller) selectVictim(candidates []PodCandidate) *PodCandidate {
+	// Filter candidates: must have PSI > 0 (swap > 0 already filtered in findCandidates)
+	var filtered []PodCandidate
+	for _, cand := range candidates {
+		if cand.PSIFullAvg10 > 0 {
+			filtered = append(filtered, cand)
+		}
 	}
 
-	return candidates[0]
+	// Log all candidates
+	klog.Infof("Candidates with swap > 0 (%d total, %d with PSI > 0):",
+		len(candidates), len(filtered))
+	for i, cand := range candidates {
+		hasPSI := ""
+		if cand.PSIFullAvg10 > 0 {
+			hasPSI = " *"
+		}
+		klog.Infof("  %d. %s/%s: swap=%d MB, PSI=%.2f%s",
+			i+1, cand.Namespace, cand.Name, cand.SwapBytes/1024/1024, cand.PSIFullAvg10, hasPSI)
+	}
+
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	// Sort by PSI full avg10 (descending), then by swap (descending) as tiebreaker
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].PSIFullAvg10 != filtered[j].PSIFullAvg10 {
+			return filtered[i].PSIFullAvg10 > filtered[j].PSIFullAvg10
+		}
+		return filtered[i].SwapBytes > filtered[j].SwapBytes
+	})
+
+	return &filtered[0]
 }
 
 func (c *Controller) terminatePod(ctx context.Context, pod PodCandidate) error {
