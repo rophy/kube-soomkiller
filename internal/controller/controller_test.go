@@ -143,3 +143,109 @@ func TestSelectVictimStability(t *testing.T) {
 	}
 }
 
+func TestExtractContainerIDFromCgroup(t *testing.T) {
+	tests := []struct {
+		name       string
+		cgroupPath string
+		want       string
+	}{
+		{
+			name:       "containerd full path",
+			cgroupPath: "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-abc123def456789012345678901234567890123456789012345678901234.scope",
+			want:       "abc123def456",
+		},
+		{
+			name:       "crio full path",
+			cgroupPath: "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/crio-abc123def456789012345678901234567890123456789012345678901234.scope",
+			want:       "abc123def456",
+		},
+		{
+			name:       "containerd short path",
+			cgroupPath: "cri-containerd-abc123def456.scope",
+			want:       "abc123def456",
+		},
+		{
+			name:       "crio short path",
+			cgroupPath: "crio-abc123def456.scope",
+			want:       "abc123def456",
+		},
+		{
+			name:       "short container ID",
+			cgroupPath: "cri-containerd-abc123.scope",
+			want:       "abc123",
+		},
+		{
+			name:       "non-container cgroup",
+			cgroupPath: "kubepods.slice/kubepods-burstable.slice/init.scope",
+			want:       "",
+		},
+		{
+			name:       "no scope suffix",
+			cgroupPath: "cri-containerd-abc123",
+			want:       "",
+		},
+		{
+			name:       "empty path",
+			cgroupPath: "",
+			want:       "",
+		},
+		{
+			name:       "unknown runtime prefix",
+			cgroupPath: "docker-abc123def456.scope",
+			want:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractContainerIDFromCgroup(tt.cgroupPath)
+			if got != tt.want {
+				t.Errorf("extractContainerIDFromCgroup(%q) = %q, want %q", tt.cgroupPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractContainerIDFromStatus(t *testing.T) {
+	tests := []struct {
+		name        string
+		containerID string
+		want        string
+	}{
+		{
+			name:        "containerd format",
+			containerID: "containerd://abc123def456789012345678901234567890123456789012345678901234",
+			want:        "abc123def456789012345678901234567890123456789012345678901234",
+		},
+		{
+			name:        "cri-o format",
+			containerID: "cri-o://abc123def456789012345678901234567890123456789012345678901234",
+			want:        "abc123def456789012345678901234567890123456789012345678901234",
+		},
+		{
+			name:        "docker format",
+			containerID: "docker://abc123def456",
+			want:        "abc123def456",
+		},
+		{
+			name:        "empty string",
+			containerID: "",
+			want:        "",
+		},
+		{
+			name:        "no separator",
+			containerID: "abc123",
+			want:        "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractContainerIDFromStatus(tt.containerID)
+			if got != tt.want {
+				t.Errorf("extractContainerIDFromStatus(%q) = %q, want %q", tt.containerID, got, tt.want)
+			}
+		})
+	}
+}
+

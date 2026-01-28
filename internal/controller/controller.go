@@ -3,12 +3,10 @@ package controller
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/rophy/kube-soomkiller/internal/cri"
 	"github.com/rophy/kube-soomkiller/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,8 +25,6 @@ type Config struct {
 	DryRun            bool
 	K8sClient         *kubernetes.Clientset
 	Metrics           *metrics.Collector
-	CRIClient         *cri.Client
-	CgroupRoot        string
 }
 
 // Controller monitors swap pressure and terminates pods when necessary
@@ -208,8 +204,12 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	// Track processed pods to avoid duplicates (multiple containers per pod)
-	processedPods := make(map[string]bool)
+	// Build a map of container ID (first 12 chars) to pod info for Burstable pods only
+	type podInfo struct {
+		Namespace string
+		Name      string
+	}
+	containerToPod := make(map[string]podInfo)
 
 	for _, pod := range pods.Items {
 		// Only consider Burstable pods - they're the only ones that get swap in LimitedSwap mode
@@ -219,84 +219,81 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 			continue
 		}
 
-		// Skip if already processed (multiple containers map to same pod)
-		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-		if processedPods[podKey] {
-			continue
-		}
-
-		// Get metrics for each container in the pod
-		var podSwapBytes int64
-		var podPSIFullAvg10 float64
-		var cgroupPath string
-		containerCount := 0
-
 		for _, cs := range pod.Status.ContainerStatuses {
 			if cs.ContainerID == "" {
 				continue
 			}
-
-			// Extract container ID from format like "containerd://abc123..." or "cri-o://abc123..."
+			// Extract container ID from "containerd://abc123..." or "cri-o://abc123..."
 			containerID := extractContainerIDFromStatus(cs.ContainerID)
 			if containerID == "" {
-				klog.V(2).Infof("Failed to extract container ID from %s", cs.ContainerID)
 				continue
 			}
-
-			// Get cgroup path from crictl
-			containerInfo, err := c.config.CRIClient.GetContainerInfo(containerID)
-			if err != nil {
-				klog.V(2).Infof("Failed to get container info for %s: %v", containerID, err)
-				continue
+			// Use first 12 chars for matching (standard short ID)
+			if len(containerID) > 12 {
+				containerID = containerID[:12]
 			}
-
-			// Convert systemd cgroup notation to filesystem path
-			fsPath, err := cri.ConvertSystemdCgroupPath(c.config.CgroupRoot, containerInfo.CgroupPath)
-			if err != nil {
-				klog.V(2).Infof("Failed to convert cgroup path %s: %v", containerInfo.CgroupPath, err)
-				continue
+			containerToPod[containerID] = podInfo{
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
 			}
-
-			// Get metrics relative to cgroup root
-			relPath, err := filepath.Rel(c.config.CgroupRoot, fsPath)
-			if err != nil {
-				relPath = strings.TrimPrefix(fsPath, c.config.CgroupRoot+"/")
-			}
-
-			podMetrics, err := c.config.Metrics.GetPodMetrics(relPath)
-			if err != nil {
-				klog.V(2).Infof("Failed to get metrics for %s: %v", relPath, err)
-				continue
-			}
-
-			// Aggregate metrics across containers
-			podSwapBytes += podMetrics.SwapCurrent
-			if podMetrics.PSI.FullAvg10 > podPSIFullAvg10 {
-				podPSIFullAvg10 = podMetrics.PSI.FullAvg10
-			}
-			if cgroupPath == "" {
-				cgroupPath = relPath
-			}
-			containerCount++
 		}
+	}
 
-		// Skip if no containers found or not using swap
-		if containerCount == 0 {
-			continue
-		}
-		if podSwapBytes == 0 {
-			klog.V(3).Infof("Skipping pod %s/%s: not using swap", pod.Namespace, pod.Name)
+	// Find all container cgroups via filesystem walk
+	cgroups, err := c.config.Metrics.FindPodCgroups()
+	if err != nil {
+		klog.Warningf("Failed to find pod cgroups: %v", err)
+		return nil, nil
+	}
+
+	// Track processed pods to avoid duplicates (multiple containers per pod)
+	processedPods := make(map[string]*PodCandidate)
+
+	for _, cgroupPath := range cgroups {
+		// Extract container ID from cgroup path
+		containerID := extractContainerIDFromCgroup(cgroupPath)
+		if containerID == "" {
 			continue
 		}
 
-		processedPods[podKey] = true
-		candidates = append(candidates, PodCandidate{
-			Namespace:    pod.Namespace,
-			Name:         pod.Name,
-			CgroupPath:   cgroupPath,
-			SwapBytes:    podSwapBytes,
-			PSIFullAvg10: podPSIFullAvg10,
-		})
+		pod, ok := containerToPod[containerID]
+		if !ok {
+			klog.V(3).Infof("Container %s not in Burstable pod list, skipping", containerID)
+			continue
+		}
+
+		podMetrics, err := c.config.Metrics.GetPodMetrics(cgroupPath)
+		if err != nil {
+			klog.V(2).Infof("Failed to get metrics for %s: %v", cgroupPath, err)
+			continue
+		}
+
+		// Skip if not using swap
+		if podMetrics.SwapCurrent == 0 {
+			continue
+		}
+
+		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+		if existing, ok := processedPods[podKey]; ok {
+			// Aggregate metrics across containers in the same pod
+			existing.SwapBytes += podMetrics.SwapCurrent
+			if podMetrics.PSI.FullAvg10 > existing.PSIFullAvg10 {
+				existing.PSIFullAvg10 = podMetrics.PSI.FullAvg10
+			}
+		} else {
+			processedPods[podKey] = &PodCandidate{
+				Namespace:    pod.Namespace,
+				Name:         pod.Name,
+				CgroupPath:   cgroupPath,
+				SwapBytes:    podMetrics.SwapCurrent,
+				PSIFullAvg10: podMetrics.PSI.FullAvg10,
+			}
+		}
+	}
+
+	// Convert map to slice
+	for _, cand := range processedPods {
+		candidates = append(candidates, *cand)
 	}
 
 	return candidates, nil
@@ -305,12 +302,44 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 // extractContainerIDFromStatus extracts container ID from Kubernetes container status
 // Input format: "containerd://abc123..." or "cri-o://abc123..."
 func extractContainerIDFromStatus(containerID string) string {
-	// Find the :// separator
 	idx := strings.Index(containerID, "://")
 	if idx == -1 {
 		return ""
 	}
 	return containerID[idx+3:]
+}
+
+// extractContainerIDFromCgroup extracts the first 12 chars of container ID from cgroup path
+// Input: kubepods.slice/.../cri-containerd-<64-char-id>.scope or crio-<64-char-id>.scope
+func extractContainerIDFromCgroup(cgroupPath string) string {
+	// Find the last path component
+	lastSlash := strings.LastIndex(cgroupPath, "/")
+	name := cgroupPath
+	if lastSlash != -1 {
+		name = cgroupPath[lastSlash+1:]
+	}
+
+	// Remove .scope suffix
+	if !strings.HasSuffix(name, ".scope") {
+		return ""
+	}
+	name = strings.TrimSuffix(name, ".scope")
+
+	// Extract container ID based on runtime prefix
+	var fullID string
+	if strings.HasPrefix(name, "cri-containerd-") {
+		fullID = strings.TrimPrefix(name, "cri-containerd-")
+	} else if strings.HasPrefix(name, "crio-") {
+		fullID = strings.TrimPrefix(name, "crio-")
+	} else {
+		return ""
+	}
+
+	// Return first 12 chars for matching
+	if len(fullID) > 12 {
+		return fullID[:12]
+	}
+	return fullID
 }
 
 func (c *Controller) selectVictim(candidates []PodCandidate) PodCandidate {

@@ -49,6 +49,68 @@ func NewCollector(cgroupRoot string) *Collector {
 	}
 }
 
+// ValidateEnvironment checks that the system meets requirements:
+// - cgroup v2 (unified hierarchy)
+// - systemd cgroup driver (kubepods.slice layout)
+func (c *Collector) ValidateEnvironment() error {
+	// Check for cgroup v2: look for cgroup.controllers file
+	cgroupControllers := filepath.Join(c.cgroupRoot, "cgroup.controllers")
+	if _, err := os.Stat(cgroupControllers); os.IsNotExist(err) {
+		return fmt.Errorf("cgroup v2 not detected: %s not found (cgroup v1 is not supported)", cgroupControllers)
+	}
+
+	// Check for systemd cgroup driver: look for kubepods.slice directory
+	kubepodsSlice := filepath.Join(c.cgroupRoot, "kubepods.slice")
+	if _, err := os.Stat(kubepodsSlice); os.IsNotExist(err) {
+		return fmt.Errorf("systemd cgroup driver not detected: %s not found (cgroupfs driver is not supported)", kubepodsSlice)
+	}
+
+	// Check for swap support: look for memory.swap.max in kubepods.slice
+	swapMax := filepath.Join(kubepodsSlice, "memory.swap.max")
+	if _, err := os.Stat(swapMax); os.IsNotExist(err) {
+		return fmt.Errorf("swap not enabled: %s not found", swapMax)
+	}
+
+	return nil
+}
+
+// FindPodCgroups finds all container cgroup paths under kubepods.slice
+// Supports both containerd (cri-containerd-) and CRI-O (crio-) runtimes
+// Layout: kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice/<runtime>-<id>.scope
+func (c *Collector) FindPodCgroups() ([]string, error) {
+	var cgroups []string
+
+	kubepodsPath := filepath.Join(c.cgroupRoot, "kubepods.slice")
+	if _, err := os.Stat(kubepodsPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("kubepods.slice not found at %s", kubepodsPath)
+	}
+
+	// Walk through kubepods hierarchy to find container cgroups
+	err := filepath.Walk(kubepodsPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors, continue walking
+		}
+
+		if !info.IsDir() {
+			return nil
+		}
+
+		name := info.Name()
+		// Match container cgroup directories:
+		// - containerd: cri-containerd-<id>.scope
+		// - CRI-O: crio-<id>.scope
+		if strings.HasSuffix(name, ".scope") &&
+			(strings.HasPrefix(name, "cri-containerd-") || strings.HasPrefix(name, "crio-")) {
+			relPath, _ := filepath.Rel(c.cgroupRoot, path)
+			cgroups = append(cgroups, relPath)
+		}
+
+		return nil
+	})
+
+	return cgroups, err
+}
+
 // GetSwapIOStats retrieves swap I/O counters from /proc/vmstat
 func (c *Collector) GetSwapIOStats() (*SwapIOStats, error) {
 	file, err := os.Open(c.vmstatPath)

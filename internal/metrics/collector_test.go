@@ -166,3 +166,141 @@ pgfault 999999
 		t.Errorf("Expected zero swap stats, got PswpIn=%d PswpOut=%d", stats.PswpIn, stats.PswpOut)
 	}
 }
+
+func TestValidateEnvironment(t *testing.T) {
+	t.Run("valid environment", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Create cgroup v2 indicator
+		if err := os.WriteFile(filepath.Join(tmpDir, "cgroup.controllers"), []byte("memory cpu"), 0644); err != nil {
+			t.Fatalf("Failed to create cgroup.controllers: %v", err)
+		}
+
+		// Create kubepods.slice with memory.swap.max
+		kubepodsPath := filepath.Join(tmpDir, "kubepods.slice")
+		if err := os.MkdirAll(kubepodsPath, 0755); err != nil {
+			t.Fatalf("Failed to create kubepods.slice: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(kubepodsPath, "memory.swap.max"), []byte("max"), 0644); err != nil {
+			t.Fatalf("Failed to create memory.swap.max: %v", err)
+		}
+
+		collector := NewCollector(tmpDir)
+		if err := collector.ValidateEnvironment(); err != nil {
+			t.Errorf("ValidateEnvironment() unexpected error: %v", err)
+		}
+	})
+
+	t.Run("missing cgroup v2", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Don't create cgroup.controllers
+
+		collector := NewCollector(tmpDir)
+		err := collector.ValidateEnvironment()
+		if err == nil {
+			t.Error("ValidateEnvironment() expected error for missing cgroup v2")
+		}
+	})
+
+	t.Run("missing kubepods.slice", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Create cgroup.controllers but not kubepods.slice
+		if err := os.WriteFile(filepath.Join(tmpDir, "cgroup.controllers"), []byte("memory cpu"), 0644); err != nil {
+			t.Fatalf("Failed to create cgroup.controllers: %v", err)
+		}
+
+		collector := NewCollector(tmpDir)
+		err := collector.ValidateEnvironment()
+		if err == nil {
+			t.Error("ValidateEnvironment() expected error for missing kubepods.slice")
+		}
+	})
+
+	t.Run("missing swap support", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Create cgroup.controllers and kubepods.slice but not memory.swap.max
+		if err := os.WriteFile(filepath.Join(tmpDir, "cgroup.controllers"), []byte("memory cpu"), 0644); err != nil {
+			t.Fatalf("Failed to create cgroup.controllers: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(tmpDir, "kubepods.slice"), 0755); err != nil {
+			t.Fatalf("Failed to create kubepods.slice: %v", err)
+		}
+
+		collector := NewCollector(tmpDir)
+		err := collector.ValidateEnvironment()
+		if err == nil {
+			t.Error("ValidateEnvironment() expected error for missing swap support")
+		}
+	})
+}
+
+func TestFindPodCgroups(t *testing.T) {
+	t.Run("finds containerd and crio cgroups", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Create kubepods.slice with mixed runtime cgroups
+		paths := []string{
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-abc123.scope",
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod456.slice/crio-def456.scope",
+			"kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod789.slice/cri-containerd-ghi789.scope",
+		}
+
+		for _, p := range paths {
+			fullPath := filepath.Join(tmpDir, p)
+			if err := os.MkdirAll(fullPath, 0755); err != nil {
+				t.Fatalf("Failed to create test directory: %v", err)
+			}
+		}
+
+		collector := NewCollector(tmpDir)
+		cgroups, err := collector.FindPodCgroups()
+		if err != nil {
+			t.Fatalf("FindPodCgroups() error = %v", err)
+		}
+
+		if len(cgroups) != 3 {
+			t.Errorf("FindPodCgroups() returned %d cgroups, want 3", len(cgroups))
+		}
+	})
+
+	t.Run("ignores non-container directories", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		paths := []string{
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-abc123.scope",
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/init.scope",
+			"kubepods.slice/kubepods-burstable.slice/some-other-dir",
+			"kubepods.slice/system.slice",
+		}
+
+		for _, p := range paths {
+			fullPath := filepath.Join(tmpDir, p)
+			if err := os.MkdirAll(fullPath, 0755); err != nil {
+				t.Fatalf("Failed to create test directory: %v", err)
+			}
+		}
+
+		collector := NewCollector(tmpDir)
+		cgroups, err := collector.FindPodCgroups()
+		if err != nil {
+			t.Fatalf("FindPodCgroups() error = %v", err)
+		}
+
+		if len(cgroups) != 1 {
+			t.Errorf("FindPodCgroups() returned %d cgroups, want 1", len(cgroups))
+		}
+	})
+
+	t.Run("error when kubepods.slice missing", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Don't create kubepods.slice
+
+		collector := NewCollector(tmpDir)
+		_, err := collector.FindPodCgroups()
+		if err == nil {
+			t.Error("FindPodCgroups() expected error when kubepods.slice missing")
+		}
+	})
+}
