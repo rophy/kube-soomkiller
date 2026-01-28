@@ -13,8 +13,7 @@ build:
   tagPolicy:
     gitCommit: {}
 manifests:
-  kustomize:
-    paths:
-      - deploy
+  rawYaml:
+    - deploy/*.yaml
 deploy:
   kubectl: {}

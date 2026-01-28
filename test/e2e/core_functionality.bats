@@ -6,8 +6,8 @@ setup() {
 }
 
 @test "swap pressure triggers detection, victim selection, and cooldown" {
-    # Run sysbench to create swap pressure (30s to trigger soomkill)
-    sysbench_run 150 30
+    # Run sysbench to create swap pressure (12s to trigger soomkill)
+    sysbench_run 150 12
 
     # Capture logs from the test period
     local logs

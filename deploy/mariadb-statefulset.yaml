@@ -36,7 +36,17 @@ spec:
         volumeMounts:
         - name: mariadb-config
           mountPath: /etc/mysql/conf.d
+        - name: data
+          mountPath: /var/lib/mysql
       volumes:
       - name: mariadb-config
         configMap:
           name: mariadb-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 500Mi
