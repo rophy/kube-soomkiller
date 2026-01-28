@@ -21,7 +21,5 @@ setup_suite() {
 }
 
 teardown_suite() {
-    # Cleanup stress pods
-    source "$(dirname "$BATS_TEST_FILENAME")/test_helper.bash"
-    cleanup_stress_pods
+    : # nothing to cleanup
 }

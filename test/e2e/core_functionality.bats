@@ -3,13 +3,8 @@
 
 setup() {
     load 'test_helper'
-    cleanup_stress_pods
     # Disable dry-run - these tests verify actual behavior
     set_dry_run false
-}
-
-teardown() {
-    cleanup_stress_pods
 }
 
 @test "swap I/O threshold triggers action when exceeded" {
