@@ -74,11 +74,19 @@ func (c *Collector) ValidateEnvironment() error {
 	return nil
 }
 
+// CgroupsResult contains the results of cgroup discovery
+type CgroupsResult struct {
+	// Recognized cgroup paths matching known container runtimes
+	Cgroups []string
+	// Unrecognized .scope directories that don't match known patterns
+	Unrecognized []string
+}
+
 // FindPodCgroups finds all container cgroup paths under kubepods.slice
 // Supports both containerd (cri-containerd-) and CRI-O (crio-) runtimes
 // Layout: kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice/<runtime>-<id>.scope
-func (c *Collector) FindPodCgroups() ([]string, error) {
-	var cgroups []string
+func (c *Collector) FindPodCgroups() (*CgroupsResult, error) {
+	result := &CgroupsResult{}
 
 	kubepodsPath := filepath.Join(c.cgroupRoot, "kubepods.slice")
 	if _, err := os.Stat(kubepodsPath); os.IsNotExist(err) {
@@ -96,19 +104,25 @@ func (c *Collector) FindPodCgroups() ([]string, error) {
 		}
 
 		name := info.Name()
+		if !strings.HasSuffix(name, ".scope") {
+			return nil
+		}
+
+		relPath, _ := filepath.Rel(c.cgroupRoot, path)
+
 		// Match container cgroup directories:
 		// - containerd: cri-containerd-<id>.scope
 		// - CRI-O: crio-<id>.scope
-		if strings.HasSuffix(name, ".scope") &&
-			(strings.HasPrefix(name, "cri-containerd-") || strings.HasPrefix(name, "crio-")) {
-			relPath, _ := filepath.Rel(c.cgroupRoot, path)
-			cgroups = append(cgroups, relPath)
+		if strings.HasPrefix(name, "cri-containerd-") || strings.HasPrefix(name, "crio-") {
+			result.Cgroups = append(result.Cgroups, relPath)
+		} else {
+			result.Unrecognized = append(result.Unrecognized, relPath)
 		}
 
 		return nil
 	})
 
-	return cgroups, err
+	return result, err
 }
 
 // GetSwapIOStats retrieves swap I/O counters from /proc/vmstat

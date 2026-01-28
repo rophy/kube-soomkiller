@@ -255,24 +255,28 @@ func TestFindPodCgroups(t *testing.T) {
 		}
 
 		collector := NewCollector(tmpDir)
-		cgroups, err := collector.FindPodCgroups()
+		result, err := collector.FindPodCgroups()
 		if err != nil {
 			t.Fatalf("FindPodCgroups() error = %v", err)
 		}
 
-		if len(cgroups) != 3 {
-			t.Errorf("FindPodCgroups() returned %d cgroups, want 3", len(cgroups))
+		if len(result.Cgroups) != 3 {
+			t.Errorf("FindPodCgroups() returned %d cgroups, want 3", len(result.Cgroups))
+		}
+		if len(result.Unrecognized) != 0 {
+			t.Errorf("FindPodCgroups() returned %d unrecognized, want 0", len(result.Unrecognized))
 		}
 	})
 
-	t.Run("ignores non-container directories", func(t *testing.T) {
+	t.Run("tracks unrecognized scope directories", func(t *testing.T) {
 		tmpDir := t.TempDir()
 
 		paths := []string{
 			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-abc123.scope",
-			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/init.scope",
-			"kubepods.slice/kubepods-burstable.slice/some-other-dir",
-			"kubepods.slice/system.slice",
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/init.scope",             // unrecognized .scope
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod456.slice/docker-def456.scope",    // unrecognized .scope
+			"kubepods.slice/kubepods-burstable.slice/some-other-dir",                                         // not a .scope, ignored
+			"kubepods.slice/system.slice",                                                                    // not a .scope dir, ignored
 		}
 
 		for _, p := range paths {
@@ -283,13 +287,16 @@ func TestFindPodCgroups(t *testing.T) {
 		}
 
 		collector := NewCollector(tmpDir)
-		cgroups, err := collector.FindPodCgroups()
+		result, err := collector.FindPodCgroups()
 		if err != nil {
 			t.Fatalf("FindPodCgroups() error = %v", err)
 		}
 
-		if len(cgroups) != 1 {
-			t.Errorf("FindPodCgroups() returned %d cgroups, want 1", len(cgroups))
+		if len(result.Cgroups) != 1 {
+			t.Errorf("FindPodCgroups() returned %d cgroups, want 1", len(result.Cgroups))
+		}
+		if len(result.Unrecognized) != 2 {
+			t.Errorf("FindPodCgroups() returned %d unrecognized, want 2: %v", len(result.Unrecognized), result.Unrecognized)
 		}
 	})
 

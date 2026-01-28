@@ -91,6 +91,9 @@ func (c *Controller) Run(ctx context.Context) error {
 	klog.Infof("Trigger: swap I/O > %d pages/sec for %s",
 		c.config.SwapIOThreshold, c.config.SustainedDuration)
 
+	// Startup check: scan cgroups to detect configuration issues early
+	c.checkCgroupsAtStartup()
+
 	ticker := time.NewTicker(c.config.PollInterval)
 	defer ticker.Stop()
 
@@ -103,6 +106,27 @@ func (c *Controller) Run(ctx context.Context) error {
 				klog.Errorf("Reconcile error: %v", err)
 			}
 		}
+	}
+}
+
+// checkCgroupsAtStartup scans cgroups once at startup to detect configuration issues early
+func (c *Controller) checkCgroupsAtStartup() {
+	result, err := c.config.Metrics.FindPodCgroups()
+	if err != nil {
+		klog.Warningf("Startup cgroup check failed: %v", err)
+		return
+	}
+
+	klog.Infof("Startup cgroup check: found %d container cgroups", len(result.Cgroups))
+
+	if len(result.Unrecognized) > 0 {
+		// Show up to 3 examples to avoid log spam
+		examples := result.Unrecognized
+		if len(examples) > 3 {
+			examples = examples[:3]
+		}
+		klog.Warningf("Startup cgroup check: found %d unrecognized cgroup patterns (not cri-containerd-* or crio-*): %v",
+			len(result.Unrecognized), examples)
 	}
 }
 
@@ -287,16 +311,27 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 	}
 
 	// Find all container cgroups via filesystem walk
-	cgroups, err := c.config.Metrics.FindPodCgroups()
+	cgroupsResult, err := c.config.Metrics.FindPodCgroups()
 	if err != nil {
 		klog.Warningf("Failed to find pod cgroups: %v", err)
 		return nil, nil
 	}
 
+	// Warn about unrecognized cgroup patterns
+	if len(cgroupsResult.Unrecognized) > 0 {
+		// Show up to 3 examples to avoid log spam
+		examples := cgroupsResult.Unrecognized
+		if len(examples) > 3 {
+			examples = examples[:3]
+		}
+		klog.Warningf("Found %d unrecognized cgroup patterns (not cri-containerd-* or crio-*): %v",
+			len(cgroupsResult.Unrecognized), examples)
+	}
+
 	// Track processed pods to avoid duplicates (multiple containers per pod)
 	processedPods := make(map[string]*PodCandidate)
 
-	for _, cgroupPath := range cgroups {
+	for _, cgroupPath := range cgroupsResult.Cgroups {
 		// Extract container ID from cgroup path
 		containerID := extractContainerIDFromCgroup(cgroupPath)
 		if containerID == "" {
