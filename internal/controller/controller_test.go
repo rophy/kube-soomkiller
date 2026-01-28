@@ -400,6 +400,28 @@ func createPodWithMultipleContainers(name, namespace, nodeName string, qosClass 
 	}
 }
 
+// Helper to create a pod with CRI-O runtime
+func createPodCRIO(name, namespace, nodeName string, qosClass corev1.PodQOSClass, containerID string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+		},
+		Status: corev1.PodStatus{
+			QOSClass: qosClass,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name:        "main",
+					ContainerID: "cri-o://" + containerID,
+				},
+			},
+		},
+	}
+}
+
 func TestFindCandidates_QoSFiltering(t *testing.T) {
 	tmpDir := t.TempDir()
 	nodeName := "test-node"
@@ -612,6 +634,48 @@ func TestFindCandidates_MultipleContainersInPod(t *testing.T) {
 	// PSI should be the max of both containers (max(3.0, 8.0) = 8.0)
 	if cand.PSIFullAvg10 != 8.0 {
 		t.Errorf("candidate PSIFullAvg10 = %.2f, want 8.0 (max)", cand.PSIFullAvg10)
+	}
+}
+
+func TestFindCandidates_CRIORuntime(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// Container ID (64 chars, first 12 used for matching)
+	containerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+
+	// Create cgroup with CRI-O format: crio-<id>.scope (not cri-containerd-)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/crio-"+containerID+".scope", 100<<20, 5.0)
+
+	// Create pod with CRI-O container ID format: cri-o://<id> (not containerd://)
+	fakeClient := fake.NewSimpleClientset(
+		createPodCRIO("crio-pod", "default", nodeName, corev1.PodQOSBurstable, containerID),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:  nodeName,
+			K8sClient: fakeClient,
+			Metrics:   metrics.NewCollector(tmpDir),
+		},
+	}
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	// Should find the CRI-O pod as a candidate
+	if len(candidates) != 1 {
+		t.Fatalf("findCandidates() returned %d candidates, want 1", len(candidates))
+	}
+
+	if candidates[0].Name != "crio-pod" {
+		t.Errorf("candidate name = %s, want crio-pod", candidates[0].Name)
+	}
+
+	if candidates[0].SwapBytes != 100<<20 {
+		t.Errorf("candidate SwapBytes = %d, want %d", candidates[0].SwapBytes, 100<<20)
 	}
 }
 
