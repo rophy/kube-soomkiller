@@ -22,7 +22,7 @@ type Config struct {
 	SustainedDuration time.Duration // how long threshold must be exceeded
 	CooldownPeriod    time.Duration // wait time after killing a pod
 	DryRun            bool
-	K8sClient         *kubernetes.Clientset
+	K8sClient         kubernetes.Interface
 	Metrics           *metrics.Collector
 }
 

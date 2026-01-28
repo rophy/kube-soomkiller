@@ -1,7 +1,16 @@
 package controller
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/rophy/kube-soomkiller/internal/metrics"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestSelectVictim(t *testing.T) {
@@ -284,5 +293,239 @@ func TestExtractContainerIDFromStatus(t *testing.T) {
 				t.Errorf("extractContainerIDFromStatus(%q) = %q, want %q", tt.containerID, got, tt.want)
 			}
 		})
+	}
+}
+
+// Helper to create a fake cgroup with metrics
+func createFakeCgroup(t *testing.T, cgroupRoot, cgroupPath string, swapBytes int64, psiFullAvg10 float64) {
+	t.Helper()
+	fullPath := filepath.Join(cgroupRoot, cgroupPath)
+	if err := os.MkdirAll(fullPath, 0755); err != nil {
+		t.Fatalf("Failed to create cgroup dir: %v", err)
+	}
+
+	files := map[string]string{
+		"memory.swap.current": fmt.Sprintf("%d", swapBytes),
+		"memory.current":      "268435456",
+		"memory.pressure": fmt.Sprintf(`some avg10=1.00 avg60=1.00 avg300=1.00 total=1000
+full avg10=%.2f avg60=1.00 avg300=1.00 total=1000`, psiFullAvg10),
+	}
+
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(fullPath, name), []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write metric file: %v", err)
+		}
+	}
+}
+
+// Helper to create a pod with specific QoS class
+func createPod(name, namespace, nodeName string, qosClass corev1.PodQOSClass, containerID string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+		},
+		Status: corev1.PodStatus{
+			QOSClass: qosClass,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name:        "main",
+					ContainerID: "containerd://" + containerID,
+				},
+			},
+		},
+	}
+}
+
+func TestCollectCandidates_QoSFiltering(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// Create cgroups for each pod
+	// Container IDs (first 12 chars used for matching)
+	burstableContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+	guaranteedContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
+	bestEffortContainerID := "ccc111222333444555666777888999000111222333444555666777888999000111"
+
+	// Create cgroups with swap usage and PSI
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/cri-containerd-"+burstableContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-guaranteed.slice/cri-containerd-"+guaranteedContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-besteffort.slice/cri-containerd-"+bestEffortContainerID+".scope", 100<<20, 5.0)
+
+	// Create fake K8s client with pods of different QoS classes
+	fakeClient := fake.NewSimpleClientset(
+		createPod("burstable-pod", "default", nodeName, corev1.PodQOSBurstable, burstableContainerID),
+		createPod("guaranteed-pod", "default", nodeName, corev1.PodQOSGuaranteed, guaranteedContainerID),
+		createPod("besteffort-pod", "default", nodeName, corev1.PodQOSBestEffort, bestEffortContainerID),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:  nodeName,
+			K8sClient: fakeClient,
+			Metrics:   metrics.NewCollector(tmpDir),
+		},
+	}
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	// Only Burstable pod should be a candidate
+	if len(candidates) != 1 {
+		t.Errorf("findCandidates() returned %d candidates, want 1", len(candidates))
+		for _, c := range candidates {
+			t.Logf("  candidate: %s/%s", c.Namespace, c.Name)
+		}
+		return
+	}
+
+	if candidates[0].Name != "burstable-pod" {
+		t.Errorf("findCandidates() candidate = %s, want burstable-pod", candidates[0].Name)
+	}
+}
+
+func TestCollectCandidates_SwapZeroFiltering(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// Container IDs
+	withSwapContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+	noSwapContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
+
+	// Create cgroups - one with swap, one without
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/cri-containerd-"+withSwapContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/cri-containerd-"+noSwapContainerID+".scope", 0, 5.0) // swap=0
+
+	// Create fake K8s client - both pods are Burstable
+	fakeClient := fake.NewSimpleClientset(
+		createPod("with-swap-pod", "default", nodeName, corev1.PodQOSBurstable, withSwapContainerID),
+		createPod("no-swap-pod", "default", nodeName, corev1.PodQOSBurstable, noSwapContainerID),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:  nodeName,
+			K8sClient: fakeClient,
+			Metrics:   metrics.NewCollector(tmpDir),
+		},
+	}
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	// Only pod with swap > 0 should be a candidate
+	if len(candidates) != 1 {
+		t.Errorf("findCandidates() returned %d candidates, want 1", len(candidates))
+		for _, c := range candidates {
+			t.Logf("  candidate: %s/%s swap=%d", c.Namespace, c.Name, c.SwapBytes)
+		}
+		return
+	}
+
+	if candidates[0].Name != "with-swap-pod" {
+		t.Errorf("findCandidates() candidate = %s, want with-swap-pod", candidates[0].Name)
+	}
+}
+
+func TestCollectCandidates_NoCandidates(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// No cgroups created - empty filesystem
+
+	// Create fake K8s client with a Burstable pod but no matching cgroup
+	containerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+	fakeClient := fake.NewSimpleClientset(
+		createPod("orphan-pod", "default", nodeName, corev1.PodQOSBurstable, containerID),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:  nodeName,
+			K8sClient: fakeClient,
+			Metrics:   metrics.NewCollector(tmpDir),
+		},
+	}
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	if len(candidates) != 0 {
+		t.Errorf("findCandidates() returned %d candidates, want 0", len(candidates))
+	}
+}
+
+func TestTerminatePod_DryRun(t *testing.T) {
+	// Create fake client with a pod
+	pod := createPod("test-pod", "default", "test-node", corev1.PodQOSBurstable, "abc123")
+	fakeClient := fake.NewSimpleClientset(pod)
+
+	c := &Controller{
+		config: Config{
+			DryRun:    true, // dry-run enabled
+			K8sClient: fakeClient,
+		},
+	}
+
+	// Call terminatePod
+	err := c.terminatePod(context.Background(), PodCandidate{
+		Namespace: "default",
+		Name:      "test-pod",
+	})
+
+	// Should succeed without error
+	if err != nil {
+		t.Fatalf("terminatePod() unexpected error: %v", err)
+	}
+
+	// Pod should still exist (not deleted in dry-run mode)
+	_, err = fakeClient.CoreV1().Pods("default").Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("pod was deleted in dry-run mode, should have been preserved")
+	}
+}
+
+func TestTerminatePod_ActualDelete(t *testing.T) {
+	// Create fake client with a pod
+	pod := createPod("test-pod", "default", "test-node", corev1.PodQOSBurstable, "abc123")
+	fakeClient := fake.NewSimpleClientset(pod)
+
+	c := &Controller{
+		config: Config{
+			DryRun:    false, // dry-run disabled
+			K8sClient: fakeClient,
+		},
+	}
+
+	// Verify pod exists before deletion
+	_, err := fakeClient.CoreV1().Pods("default").Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("pod should exist before deletion: %v", err)
+	}
+
+	// Call terminatePod
+	err = c.terminatePod(context.Background(), PodCandidate{
+		Namespace: "default",
+		Name:      "test-pod",
+	})
+
+	// Should succeed without error
+	if err != nil {
+		t.Fatalf("terminatePod() unexpected error: %v", err)
+	}
+
+	// Pod should be deleted
+	_, err = fakeClient.CoreV1().Pods("default").Get(context.Background(), "test-pod", metav1.GetOptions{})
+	if err == nil {
+		t.Errorf("pod still exists after terminatePod(), should have been deleted")
 	}
 }
