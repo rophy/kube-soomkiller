@@ -217,28 +217,17 @@ kubectl exec test-swap -- cat /proc/self/cgroup
 **Running the stress test:**
 
 ```bash
-# Create sysbench database
-kubectl exec -n kube-soomkiller mariadb-0 -- \
-  mariadb -uroot -ptestpass -e "CREATE DATABASE IF NOT EXISTS sbtest;"
+# Run stress test with 50 threads for 60 seconds (outputs JSON with metrics)
+./test/stress/run-test.sh 50 60
 
-# Prepare tables
-kubectl exec -n kube-soomkiller deploy/sysbench -- \
-  sysbench /usr/share/sysbench/oltp_read_write.lua \
-  --mysql-host=mariadb --mysql-port=3306 \
-  --mysql-user=root --mysql-password=testpass \
-  --mysql-db=sbtest --tables=10 --table-size=100000 prepare
+# Higher thread count to trigger swap pressure
+./test/stress/run-test.sh 150 120
 
-# Run stress test (150 threads to trigger swap pressure)
-kubectl exec -n kube-soomkiller deploy/sysbench -- \
-  sysbench /usr/share/sysbench/oltp_read_write.lua \
-  --mysql-host=mariadb --mysql-port=3306 \
-  --mysql-user=root --mysql-password=testpass \
-  --mysql-db=sbtest --tables=10 --table-size=100000 \
-  --threads=150 --time=120 --report-interval=10 run
-
-# Monitor soomkiller logs
+# Monitor soomkiller logs in another terminal
 kubectl logs -n kube-soomkiller daemonset/kube-soomkiller -f
 ```
+
+The script handles MariaDB restart, table preparation, sysbench execution, and Prometheus metrics collection. Output includes TPS, latency, memory/swap usage, and swap I/O time series.
 
 When swap I/O exceeds 1000 pages/sec for 10 seconds, soomkiller will terminate the MariaDB pod gracefully.
 

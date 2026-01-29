@@ -55,6 +55,11 @@ The `setup_suite.bash` file handles one-time setup automatically when running `b
 - Waits for daemonset rollout
 - Prepares sysbench database
 
-### Manual Stress Testing
+### Stress Testing
 
-Follow the instructions in README.md for how to deploy and perform stress test.
+Run stress test with metrics collection:
+```bash
+./test/stress/run-test.sh <threads> [duration]
+```
+
+Example: `./test/stress/run-test.sh 50 60` runs 50 threads for 60 seconds.
