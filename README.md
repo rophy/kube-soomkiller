@@ -62,7 +62,7 @@ The controller exposes metrics on `:8080/metrics`:
 | `soomkiller_swap_io_threshold_exceeded_duration_seconds` | Gauge | How long threshold has been exceeded |
 | `soomkiller_cooldown_remaining_seconds` | Gauge | Seconds remaining in cooldown |
 | `soomkiller_pods_killed_total` | Counter | Total pods killed |
-| `soomkiller_last_kill_timestamp` | Gauge | Unix timestamp of last pod kill |
+| `soomkiller_last_kill_timestamp_seconds` | Gauge | Unix timestamp of last pod kill |
 | `soomkiller_candidate_pods_count` | Gauge | Pods currently using swap |
 | `soomkiller_pod_swap_bytes{namespace,pod}` | Gauge | Swap usage per pod |
 | `soomkiller_pod_psi_full_avg10{namespace,pod}` | Gauge | PSI value per pod |
