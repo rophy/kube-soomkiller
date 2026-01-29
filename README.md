@@ -83,14 +83,14 @@ annotations:
 ### Building from Source
 
 ```bash
-# Build binary
-make build
-
 # Build container image
 make image
 
-# Run tests
-make test
+# Run linter and unit tests
+make test-unit
+
+# Run e2e tests (requires K3s cluster)
+make test-e2e
 ```
 
 ### Testing with K3s (Multipass)
