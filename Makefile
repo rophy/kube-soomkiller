@@ -13,9 +13,12 @@ IMAGE ?= $(IMAGE_NAME):$(IMAGE_TAG)
 BINARY_NAME = kube-soomkiller
 GO = go
 
-.PHONY: all build test lint clean image push help
+.PHONY: help all build test lint clean image push \
+	k3s-up k3s-down k3s-status k3s-kubeconfig k3s-ssh
 
-all: build
+.DEFAULT_GOAL := help
+
+all: build ## Build all targets
 
 ## Build
 
@@ -79,7 +82,24 @@ clean: ## Clean build artifacts
 	rm -rf bin/
 	rm -f coverage.out coverage.html
 
+## K3s Cluster (Multipass)
+
+k3s-up: ## Create K3s cluster with swap enabled
+	./scripts/setup-k3s-multipass.sh up
+
+k3s-down: ## Delete K3s cluster
+	./scripts/setup-k3s-multipass.sh down
+
+k3s-status: ## Show K3s cluster status
+	./scripts/setup-k3s-multipass.sh status
+
+k3s-kubeconfig: ## Output K3s kubeconfig
+	./scripts/setup-k3s-multipass.sh kubeconfig
+
+k3s-ssh: ## SSH to K3s server (use K3S_NODE=name for other nodes)
+	./scripts/setup-k3s-multipass.sh ssh $(K3S_NODE)
+
 ## Help
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
