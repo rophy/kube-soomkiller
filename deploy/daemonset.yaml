@@ -64,9 +64,11 @@ spec:
               mountPath: /sys/fs/cgroup
               readOnly: true
           resources:
+            # requests = limits for Guaranteed QoS
+            # Prevents controller from being swapped under pressure
             requests:
-              cpu: 10m
-              memory: 32Mi
+              cpu: 100m
+              memory: 64Mi
             limits:
               cpu: 100m
               memory: 64Mi

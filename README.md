@@ -45,7 +45,8 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 | `--sustained-duration` | 10s | How long threshold must be exceeded |
 | `--poll-interval` | 1s | How often to sample /proc/vmstat |
 | `--cooldown-period` | 30s | Wait time after killing a pod |
-| `--dry-run` | true | Log actions without executing |
+| `--dry-run` | true | Log actions without executing (also via `DRY_RUN` env var) |
+| `--cgroup-root` | /sys/fs/cgroup | Path to cgroup v2 root |
 | `--metrics-addr` | :8080 | Address to serve Prometheus metrics |
 
 **Note:** With 1s poll interval and 10s sustained duration, the controller requires 10 consecutive samples above threshold before acting. This filters out short spikes while remaining responsive to real pressure.
@@ -61,6 +62,7 @@ The controller exposes metrics on `:8080/metrics`:
 | `soomkiller_swap_io_threshold_exceeded_duration_seconds` | Gauge | How long threshold has been exceeded |
 | `soomkiller_cooldown_remaining_seconds` | Gauge | Seconds remaining in cooldown |
 | `soomkiller_pods_killed_total` | Counter | Total pods killed |
+| `soomkiller_last_kill_timestamp` | Gauge | Unix timestamp of last pod kill |
 | `soomkiller_candidate_pods_count` | Gauge | Pods currently using swap |
 | `soomkiller_pod_swap_bytes{namespace,pod}` | Gauge | Swap usage per pod |
 | `soomkiller_pod_psi_full_avg10{namespace,pod}` | Gauge | PSI value per pod |
@@ -486,7 +488,7 @@ The controller DaemonSet must be running. If it fails:
 - System falls back to kernel OOM kill behavior
 - No graceful termination
 
-Recommendation: Set high priority class and resource requests to ensure controller survives pressure.
+**Important:** The controller must use Guaranteed QoS (set `requests = limits` for memory) to prevent itself from being swapped or selected as a victim. Without this, under memory pressure the controller's memory could be swapped, making it unresponsive when it's needed most.
 
 ## Comparison with Alternatives
 
