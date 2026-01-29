@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +20,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+var version = "dev"
+
 func main() {
 	var (
 		kubeconfig          string
@@ -31,8 +34,10 @@ func main() {
 		dryRun              bool
 		metricsAddr         string
 		protectedNamespaces string
+		showVersion         bool
 	)
 
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not set)")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node to monitor")
 	flag.DurationVar(&pollInterval, "poll-interval", 1*time.Second, "How often to sample /proc/vmstat (minimum 1s)")
@@ -46,6 +51,11 @@ func main() {
 
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	// Validate required parameters
 	if nodeName == "" {

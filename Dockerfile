@@ -14,8 +14,11 @@ RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
 
+# Version injected at build time
+ARG VERSION=dev
+
 # Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o kube-soomkiller ./cmd/kube-soomkiller
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o kube-soomkiller ./cmd/kube-soomkiller
 
 # Runtime stage - distroless for minimal attack surface
 FROM gcr.io/distroless/static:nonroot
