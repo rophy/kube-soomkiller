@@ -41,13 +41,14 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--swap-io-threshold` | 1000 | Swap I/O rate (pages/sec) to trigger action |
+| `--swap-io-threshold` | 1000 | Swap I/O rate (pages/sec) to trigger action (must be > 0) |
 | `--sustained-duration` | 10s | How long threshold must be exceeded |
-| `--poll-interval` | 1s | How often to sample /proc/vmstat |
+| `--poll-interval` | 1s | How often to sample /proc/vmstat (minimum 1s) |
 | `--cooldown-period` | 30s | Wait time after killing a pod |
 | `--dry-run` | true | Log actions without executing (also via `DRY_RUN` env var) |
 | `--cgroup-root` | /sys/fs/cgroup | Path to cgroup v2 root |
 | `--metrics-addr` | :8080 | Address to serve Prometheus metrics |
+| `--protected-namespaces` | kube-system | Comma-separated list of namespaces to never kill pods from |
 
 **Note:** With 1s poll interval and 10s sustained duration, the controller requires 10 consecutive samples above threshold before acting. This filters out short spikes while remaining responsive to real pressure.
 

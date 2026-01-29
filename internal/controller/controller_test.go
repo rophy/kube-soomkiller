@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rophy/kube-soomkiller/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
@@ -765,5 +766,100 @@ func TestTerminatePod_NonExistent(t *testing.T) {
 	// Should return an error
 	if err == nil {
 		t.Errorf("terminatePod() should return error for non-existent pod")
+	}
+}
+
+func TestFindCandidates_ProtectedNamespaces(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// Container IDs for pods in different namespaces
+	defaultContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+	kubeSystemContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
+	monitoringContainerID := "ccc111222333444555666777888999000111222333444555666777888999000111"
+
+	// Create cgroups for all pods
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+defaultContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podbbb.slice/cri-containerd-"+kubeSystemContainerID+".scope", 200<<20, 10.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podccc.slice/cri-containerd-"+monitoringContainerID+".scope", 150<<20, 7.0)
+
+	// Create pods in different namespaces
+	fakeClient := fake.NewSimpleClientset(
+		createPod("user-pod", "default", nodeName, corev1.PodQOSBurstable, defaultContainerID),
+		createPod("coredns", "kube-system", nodeName, corev1.PodQOSBurstable, kubeSystemContainerID),
+		createPod("prometheus", "monitoring", nodeName, corev1.PodQOSBurstable, monitoringContainerID),
+	)
+
+	c := New(Config{
+		NodeName:            nodeName,
+		K8sClient:           fakeClient,
+		Metrics:             metrics.NewCollector(tmpDir),
+		ProtectedNamespaces: []string{"kube-system", "monitoring"},
+	})
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	// Only the pod in "default" namespace should be a candidate
+	if len(candidates) != 1 {
+		t.Fatalf("findCandidates() returned %d candidates, want 1", len(candidates))
+	}
+
+	if candidates[0].Name != "user-pod" {
+		t.Errorf("findCandidates() candidate = %s, want user-pod", candidates[0].Name)
+	}
+
+	if candidates[0].Namespace != "default" {
+		t.Errorf("findCandidates() candidate namespace = %s, want default", candidates[0].Namespace)
+	}
+}
+
+func TestCalculateBackoff(t *testing.T) {
+	c := &Controller{}
+
+	tests := []struct {
+		consecutiveErrors int
+		expectedBackoff   time.Duration
+	}{
+		{0, 0},
+		{1, 1 * time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{4, 8 * time.Second},
+		{5, 16 * time.Second},
+		{6, 32 * time.Second},
+		{7, 60 * time.Second}, // capped at 60s
+		{10, 60 * time.Second}, // still capped
+	}
+
+	for _, tt := range tests {
+		c.consecutiveAPIErrors = tt.consecutiveErrors
+		got := c.calculateBackoff()
+		if got != tt.expectedBackoff {
+			t.Errorf("calculateBackoff() with %d errors = %v, want %v",
+				tt.consecutiveErrors, got, tt.expectedBackoff)
+		}
+	}
+}
+
+func TestNewController_ProtectedNamespacesMap(t *testing.T) {
+	c := New(Config{
+		ProtectedNamespaces: []string{"kube-system", "monitoring", "default"},
+	})
+
+	// Verify the map is built correctly
+	if !c.protectedNamespaces["kube-system"] {
+		t.Error("kube-system should be in protected namespaces")
+	}
+	if !c.protectedNamespaces["monitoring"] {
+		t.Error("monitoring should be in protected namespaces")
+	}
+	if !c.protectedNamespaces["default"] {
+		t.Error("default should be in protected namespaces")
+	}
+	if c.protectedNamespaces["other"] {
+		t.Error("other should not be in protected namespaces")
 	}
 }

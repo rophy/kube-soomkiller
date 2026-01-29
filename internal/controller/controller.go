@@ -16,14 +16,15 @@ import (
 
 // Config holds controller configuration
 type Config struct {
-	NodeName          string
-	PollInterval      time.Duration
-	SwapIOThreshold   int           // pages/sec to trigger action
-	SustainedDuration time.Duration // how long threshold must be exceeded
-	CooldownPeriod    time.Duration // wait time after killing a pod
-	DryRun            bool
-	K8sClient         kubernetes.Interface
-	Metrics           *metrics.Collector
+	NodeName            string
+	PollInterval        time.Duration
+	SwapIOThreshold     int           // pages/sec to trigger action
+	SustainedDuration   time.Duration // how long threshold must be exceeded
+	CooldownPeriod      time.Duration // wait time after killing a pod
+	DryRun              bool
+	ProtectedNamespaces []string // namespaces to never kill pods from
+	K8sClient           kubernetes.Interface
+	Metrics             *metrics.Collector
 }
 
 // Controller monitors swap pressure and terminates pods when necessary
@@ -36,10 +37,17 @@ type Controller struct {
 	thresholdExceeded time.Time // when threshold was first exceeded
 	lastKillTime      time.Time // when we last killed a pod
 
+	// API error backoff state
+	consecutiveAPIErrors int
+	lastAPIErrorTime     time.Time
+
 	// Logging state (to reduce log frequency)
 	lastStatusLogTime time.Time
 	lastLoggedRate    float64
 	lastRateAbove     bool // was rate above threshold on last check
+
+	// Protected namespaces (precomputed as map for O(1) lookup)
+	protectedNamespaces map[string]bool
 }
 
 // PodCandidate represents a pod that may be terminated
@@ -51,11 +59,37 @@ type PodCandidate struct {
 	PSIFullAvg10 float64
 }
 
+// Constants for exponential backoff
+const (
+	maxBackoffDuration = 60 * time.Second
+	baseBackoffDuration = 1 * time.Second
+)
+
 // New creates a new controller
 func New(config Config) *Controller {
-	return &Controller{
-		config: config,
+	// Build protected namespaces map for O(1) lookup
+	protectedNS := make(map[string]bool)
+	for _, ns := range config.ProtectedNamespaces {
+		protectedNS[ns] = true
 	}
+
+	return &Controller{
+		config:              config,
+		protectedNamespaces: protectedNS,
+	}
+}
+
+// calculateBackoff returns the backoff duration based on consecutive errors
+func (c *Controller) calculateBackoff() time.Duration {
+	if c.consecutiveAPIErrors == 0 {
+		return 0
+	}
+	// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped)
+	backoff := baseBackoffDuration * time.Duration(1<<(c.consecutiveAPIErrors-1))
+	if backoff > maxBackoffDuration {
+		backoff = maxBackoffDuration
+	}
+	return backoff
 }
 
 // shouldLogStatus returns true if we should log the current status.
@@ -90,6 +124,9 @@ func (c *Controller) Run(ctx context.Context) error {
 	klog.Infof("Controller started, polling every %s", c.config.PollInterval)
 	klog.Infof("Trigger: swap I/O > %d pages/sec for %s",
 		c.config.SwapIOThreshold, c.config.SustainedDuration)
+	if len(c.config.ProtectedNamespaces) > 0 {
+		klog.Infof("Protected namespaces (will not kill pods from): %v", c.config.ProtectedNamespaces)
+	}
 
 	// Startup check: scan cgroups to detect configuration issues early
 	c.checkCgroupsAtStartup()
@@ -132,6 +169,16 @@ func (c *Controller) checkCgroupsAtStartup() {
 
 func (c *Controller) reconcile(ctx context.Context) error {
 	now := time.Now()
+
+	// Check if we're in API error backoff
+	if c.consecutiveAPIErrors > 0 {
+		backoff := c.calculateBackoff()
+		if now.Sub(c.lastAPIErrorTime) < backoff {
+			klog.V(2).Infof("In API error backoff (%s remaining), skipping reconcile",
+				(backoff - now.Sub(c.lastAPIErrorTime)).Round(time.Second))
+			return nil
+		}
+	}
 
 	// Get current swap I/O stats
 	swapIO, err := c.config.Metrics.GetSwapIOStats()
@@ -218,8 +265,16 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	// Find pods using swap
 	candidates, err := c.findCandidates(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to find candidates: %w", err)
+		// Track consecutive API errors for exponential backoff
+		c.consecutiveAPIErrors++
+		c.lastAPIErrorTime = now
+		backoff := c.calculateBackoff()
+		klog.Warningf("Failed to find candidates (attempt %d, next retry in %s): %v",
+			c.consecutiveAPIErrors, backoff, err)
+		return nil // Don't propagate error, we'll retry with backoff
 	}
+	// Reset error count on success
+	c.consecutiveAPIErrors = 0
 
 	// Update candidate count metric
 	metrics.CandidatePodsCount.Set(float64(len(candidates)))
@@ -283,6 +338,13 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 	containerToPod := make(map[string]podInfo)
 
 	for _, pod := range pods.Items {
+		// Skip pods in protected namespaces
+		if c.protectedNamespaces[pod.Namespace] {
+			klog.V(3).Infof("Skipping pod %s/%s: namespace is protected",
+				pod.Namespace, pod.Name)
+			continue
+		}
+
 		// Only consider Burstable pods - they're the only ones that get swap in LimitedSwap mode
 		if pod.Status.QOSClass != corev1.PodQOSBurstable {
 			klog.V(3).Infof("Skipping pod %s/%s: QoS class is %s (not Burstable)",

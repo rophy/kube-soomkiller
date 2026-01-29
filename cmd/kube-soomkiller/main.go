@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,32 +21,43 @@ import (
 
 func main() {
 	var (
-		kubeconfig        string
-		nodeName          string
-		pollInterval      time.Duration
-		swapIOThreshold   int
-		sustainedDuration time.Duration
-		cooldownPeriod    time.Duration
-		cgroupRoot        string
-		dryRun            bool
-		metricsAddr       string
+		kubeconfig          string
+		nodeName            string
+		pollInterval        time.Duration
+		swapIOThreshold     int
+		sustainedDuration   time.Duration
+		cooldownPeriod      time.Duration
+		cgroupRoot          string
+		dryRun              bool
+		metricsAddr         string
+		protectedNamespaces string
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not set)")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node to monitor")
-	flag.DurationVar(&pollInterval, "poll-interval", 1*time.Second, "How often to sample /proc/vmstat")
-	flag.IntVar(&swapIOThreshold, "swap-io-threshold", 1000, "Swap I/O rate (pages/sec) to trigger action")
+	flag.DurationVar(&pollInterval, "poll-interval", 1*time.Second, "How often to sample /proc/vmstat (minimum 1s)")
+	flag.IntVar(&swapIOThreshold, "swap-io-threshold", 1000, "Swap I/O rate (pages/sec) to trigger action (must be > 0)")
 	flag.DurationVar(&sustainedDuration, "sustained-duration", 10*time.Second, "How long threshold must be exceeded before action")
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 30*time.Second, "Wait time after killing a pod")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
 	flag.BoolVar(&dryRun, "dry-run", getEnvBool("DRY_RUN", true), "Log actions without executing")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "Address to serve Prometheus metrics on")
+	flag.StringVar(&protectedNamespaces, "protected-namespaces", "kube-system", "Comma-separated list of namespaces to never kill pods from")
 
 	klog.InitFlags(nil)
 	flag.Parse()
 
+	// Validate required parameters
 	if nodeName == "" {
 		klog.Fatal("--node-name or NODE_NAME environment variable is required")
+	}
+
+	// Validate configuration parameters
+	if pollInterval < time.Second {
+		klog.Fatalf("--poll-interval must be at least 1s, got %s", pollInterval)
+	}
+	if swapIOThreshold <= 0 {
+		klog.Fatalf("--swap-io-threshold must be greater than 0, got %d", swapIOThreshold)
 	}
 
 	klog.Infof("Starting kube-soomkiller on node %s", nodeName)
@@ -93,16 +105,28 @@ func main() {
 	}
 	klog.Info("Environment validated: cgroup v2, systemd cgroup driver, swap enabled")
 
+	// Parse protected namespaces
+	var protectedNSList []string
+	if protectedNamespaces != "" {
+		for _, ns := range strings.Split(protectedNamespaces, ",") {
+			ns = strings.TrimSpace(ns)
+			if ns != "" {
+				protectedNSList = append(protectedNSList, ns)
+			}
+		}
+	}
+
 	// Create controller
 	ctrl := controller.New(controller.Config{
-		NodeName:          nodeName,
-		PollInterval:      pollInterval,
-		SwapIOThreshold:   swapIOThreshold,
-		SustainedDuration: sustainedDuration,
-		CooldownPeriod:    cooldownPeriod,
-		DryRun:            dryRun,
-		K8sClient:         k8sClient,
-		Metrics:           metricsCollector,
+		NodeName:            nodeName,
+		PollInterval:        pollInterval,
+		SwapIOThreshold:     swapIOThreshold,
+		SustainedDuration:   sustainedDuration,
+		CooldownPeriod:      cooldownPeriod,
+		DryRun:              dryRun,
+		ProtectedNamespaces: protectedNSList,
+		K8sClient:           k8sClient,
+		Metrics:             metricsCollector,
 	})
 
 	// Handle shutdown gracefully

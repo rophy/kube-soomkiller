@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"k8s.io/klog/v2"
 )
 
 // PSI represents Pressure Stall Information for a cgroup
@@ -145,9 +147,19 @@ func (c *Collector) GetSwapIOStats() (*SwapIOStats, error) {
 
 		switch fields[0] {
 		case "pswpin":
-			stats.PswpIn, _ = strconv.ParseUint(fields[1], 10, 64)
+			val, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				klog.Warningf("Failed to parse pswpin value %q: %v", fields[1], err)
+			} else {
+				stats.PswpIn = val
+			}
 		case "pswpout":
-			stats.PswpOut, _ = strconv.ParseUint(fields[1], 10, 64)
+			val, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				klog.Warningf("Failed to parse pswpout value %q: %v", fields[1], err)
+			} else {
+				stats.PswpOut = val
+			}
 		}
 	}
 
