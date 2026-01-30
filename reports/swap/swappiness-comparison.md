@@ -9,9 +9,36 @@
 - **Swap:** dm-crypt, 6GB
 - **Workload:** sysbench oltp_read_write
 - **Duration:** 2 minutes per run
-- **Runs:** 5 per configuration
 
-## Results
+## Thread Calibration
+
+### swappiness=0 (worker-1)
+
+| Threads | Runs | Swap Triggered | OOMKilled |
+|---------|------|----------------|-----------|
+| 133 | 10 | 0% (0/10) | 0% (0/10) |
+| 134 | 10 | 0% (0/10) | 30% (3/10) |
+| 140 | 5 | 0% (0/5) | 100% (5/5) |
+
+### swappiness=1 (worker-1)
+
+| Threads | Runs | Swap Triggered | OOMKilled |
+|---------|------|----------------|-----------|
+| 130 | 5 | 0% (0/5) | 0% (0/5) |
+| 133 | 5 | 0% (0/5) | 0% (0/5) |
+| 134 | 10 | 90% (9/10) | 0% (0/10) |
+| 135 | 5 | 80% (4/5) | 0% (0/5) |
+| 136 | 5 | 100% (5/5) | 0% (0/5) |
+| 137 | 5 | 100% (5/5) | 0% (0/5) |
+
+### swappiness=60 (worker-2)
+
+| Threads | Runs | Swap Triggered | OOMKilled |
+|---------|------|----------------|-----------|
+| 133 | 5 | 0% (0/5) | 0% (0/5) |
+| 137 | 4 | 100% (4/4) | 0% (0/4) |
+
+## Detailed Results
 
 ### swappiness=0 (140 threads)
 
@@ -35,7 +62,7 @@
 | 4 | 511MB | 27MB | 350/sec | 161.85 | Survived |
 | 5 | 511MB | 7MB | 169/sec | 164.00 | Survived |
 
-**Result:** 100% swap, 0% OOMKilled
+**Result:** 100% swap, 0% OOMKilled, Avg TPS: 163.59
 
 ### swappiness=60 (137 threads)
 
@@ -47,17 +74,14 @@
 | 4 | 511MB | 34MB | 460/sec | 152.17 | Survived |
 | 5 | 511MB | 5MB | 137/sec | 171.82 | Survived |
 
-**Result:** 100% swap, 0% OOMKilled
+**Result:** 100% swap, 0% OOMKilled, Avg TPS: 164.57
 
 ## Summary
 
-| Swappiness | Swap Triggered | OOMKilled | Avg TPS |
-|------------|----------------|-----------|---------|
-| 0 | 0% | 100% | N/A |
-| 1 | 100% | 0% | 163.59 |
-| 60 | 100% | 0% | 164.57 |
-
-## Conclusion
-
-- **swappiness=0** prevents swap entirely, resulting in OOMKill
-- **swappiness=1 and swappiness=60** show similar behavior at this workload - both trigger swap and prevent OOMKill
+| Swappiness | Threads | Swap Triggered | OOMKilled | Avg TPS |
+|------------|---------|----------------|-----------|---------|
+| 0 | 134 | 0% | 30% | 163.64 |
+| 0 | 140 | 0% | 100% | N/A |
+| 1 | 134 | 90% | 0% | 162.22 |
+| 1 | 137 | 100% | 0% | 163.59 |
+| 60 | 137 | 100% | 0% | 164.57 |
