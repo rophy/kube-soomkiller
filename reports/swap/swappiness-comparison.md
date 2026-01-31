@@ -1,6 +1,6 @@
 # Swappiness Comparison: 0 vs 1 vs 60
 
-**Date:** 2026-01-30
+**Date:** 2026-01-31
 **Cluster:** K3s v1.31.6 on multipass VMs
 **Target:** MariaDB with 512Mi memory limit
 
@@ -8,9 +8,8 @@
 
 - **Swap:** dm-crypt, 6GB
 - **Workload:** sysbench oltp_read_write
-- **Duration:** 2 minutes per run
 
-## Thread Calibration
+## Thread Calibration (2 min runs)
 
 ### swappiness=0 (worker-1)
 
@@ -38,7 +37,15 @@
 | 133 | 5 | 0% (0/5) | 0% (0/5) |
 | 137 | 4 | 100% (4/4) | 0% (0/4) |
 
-## Detailed Results
+## Long Duration Tests
+
+| Swappiness | Threads | Duration | Peak Memory | Peak Swap | Status |
+|------------|---------|----------|-------------|-----------|--------|
+| 0 | 133 | 30 min | 507MB | 0MB | Survived |
+| 0 | 134 | 30 min | 511MB | 0MB | OOMKilled (~2 min) |
+| 60 | 133 | 60 min | 511MB | 34MB | Survived |
+
+## Detailed Results (2 min runs)
 
 ### swappiness=0 (140 threads)
 
