@@ -24,26 +24,22 @@ var version = "dev"
 
 func main() {
 	var (
-		kubeconfig          string
-		nodeName            string
-		pollInterval        time.Duration
-		swapIOThreshold     int
-		sustainedDuration   time.Duration
-		cooldownPeriod      time.Duration
-		cgroupRoot          string
-		dryRun              bool
-		metricsAddr         string
-		protectedNamespaces string
-		showVersion         bool
+		kubeconfig            string
+		nodeName              string
+		pollInterval          time.Duration
+		swapThresholdPercent  float64
+		cgroupRoot            string
+		dryRun                bool
+		metricsAddr           string
+		protectedNamespaces   string
+		showVersion           bool
 	)
 
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not set)")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node to monitor")
 	flag.DurationVar(&pollInterval, "poll-interval", 1*time.Second, "How often to sample /proc/vmstat (minimum 1s)")
-	flag.IntVar(&swapIOThreshold, "swap-io-threshold", 1000, "Swap I/O rate (pages/sec) to trigger action (must be > 0)")
-	flag.DurationVar(&sustainedDuration, "sustained-duration", 10*time.Second, "How long threshold must be exceeded before action")
-	flag.DurationVar(&cooldownPeriod, "cooldown-period", 30*time.Second, "Wait time after killing a pod")
+	flag.Float64Var(&swapThresholdPercent, "swap-threshold-percent", 1.0, "Kill pods with swap usage > this % of memory limit")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
 	flag.BoolVar(&dryRun, "dry-run", getEnvBool("DRY_RUN", true), "Log actions without executing")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "Address to serve Prometheus metrics on")
@@ -66,21 +62,19 @@ func main() {
 	if pollInterval < time.Second {
 		klog.Fatalf("--poll-interval must be at least 1s, got %s", pollInterval)
 	}
-	if swapIOThreshold <= 0 {
-		klog.Fatalf("--swap-io-threshold must be greater than 0, got %d", swapIOThreshold)
+	if swapThresholdPercent < 0 {
+		klog.Fatalf("--swap-threshold-percent must be >= 0, got %f", swapThresholdPercent)
 	}
 
 	klog.Infof("Starting kube-soomkiller on node %s", nodeName)
-	klog.Infof("Config: poll-interval=%s, swap-io-threshold=%d pages/sec, sustained-duration=%s, cooldown-period=%s, dry-run=%v",
-		pollInterval, swapIOThreshold, sustainedDuration, cooldownPeriod, dryRun)
+	klog.Infof("Config: poll-interval=%s, swap-threshold-percent=%.1f%%, dry-run=%v",
+		pollInterval, swapThresholdPercent, dryRun)
 
 	// Register Prometheus metrics
 	metrics.RegisterMetrics()
 
 	// Set config metrics
-	metrics.ConfigSwapIOThreshold.Set(float64(swapIOThreshold))
-	metrics.ConfigSustainedDuration.Set(sustainedDuration.Seconds())
-	metrics.ConfigCooldownPeriod.Set(cooldownPeriod.Seconds())
+	metrics.ConfigSwapThresholdPercent.Set(swapThresholdPercent)
 	if dryRun {
 		metrics.ConfigDryRun.Set(1)
 	} else {
@@ -128,15 +122,13 @@ func main() {
 
 	// Create controller
 	ctrl := controller.New(controller.Config{
-		NodeName:            nodeName,
-		PollInterval:        pollInterval,
-		SwapIOThreshold:     swapIOThreshold,
-		SustainedDuration:   sustainedDuration,
-		CooldownPeriod:      cooldownPeriod,
-		DryRun:              dryRun,
-		ProtectedNamespaces: protectedNSList,
-		K8sClient:           k8sClient,
-		Metrics:             metricsCollector,
+		NodeName:             nodeName,
+		PollInterval:         pollInterval,
+		SwapThresholdPercent: swapThresholdPercent,
+		DryRun:               dryRun,
+		ProtectedNamespaces:  protectedNSList,
+		K8sClient:            k8sClient,
+		Metrics:              metricsCollector,
 	})
 
 	// Handle shutdown gracefully

@@ -16,24 +16,6 @@ var (
 		Help:      "Current swap I/O rate in pages per second (pswpin + pswpout)",
 	})
 
-	SwapIOThresholdExceeded = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "swap_io_threshold_exceeded",
-		Help:      "1 if swap I/O rate exceeds threshold, 0 otherwise",
-	})
-
-	SwapIOThresholdExceededDuration = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "swap_io_threshold_exceeded_duration_seconds",
-		Help:      "How long the swap I/O threshold has been exceeded",
-	})
-
-	CooldownRemaining = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "cooldown_remaining_seconds",
-		Help:      "Seconds remaining in cooldown period after killing a pod",
-	})
-
 	// Pod termination metrics
 	PodsKilledTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
@@ -61,29 +43,23 @@ var (
 		Help:      "Swap usage in bytes per pod",
 	}, []string{"namespace", "pod"})
 
-	PodPSIFullAvg10 = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	PodSwapPercent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
-		Name:      "pod_psi_full_avg10",
-		Help:      "PSI full avg10 value per pod",
+		Name:      "pod_swap_percent",
+		Help:      "Swap usage as percentage of memory limit per pod",
+	}, []string{"namespace", "pod"})
+
+	PodMemoryMax = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "pod_memory_max_bytes",
+		Help:      "Memory limit (memory.max) in bytes per pod",
 	}, []string{"namespace", "pod"})
 
 	// Configuration metrics (for visibility)
-	ConfigSwapIOThreshold = prometheus.NewGauge(prometheus.GaugeOpts{
+	ConfigSwapThresholdPercent = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
-		Name:      "config_swap_io_threshold_pages_per_second",
-		Help:      "Configured swap I/O threshold in pages per second",
-	})
-
-	ConfigSustainedDuration = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "config_sustained_duration_seconds",
-		Help:      "Configured sustained duration before taking action",
-	})
-
-	ConfigCooldownPeriod = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "config_cooldown_period_seconds",
-		Help:      "Configured cooldown period after killing a pod",
+		Name:      "config_swap_threshold_percent",
+		Help:      "Configured swap threshold as percentage of memory limit",
 	})
 
 	ConfigDryRun = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -98,9 +74,6 @@ func RegisterMetrics() {
 	prometheus.MustRegister(
 		// Node-level
 		SwapIORate,
-		SwapIOThresholdExceeded,
-		SwapIOThresholdExceededDuration,
-		CooldownRemaining,
 
 		// Pod termination
 		PodsKilledTotal,
@@ -109,12 +82,11 @@ func RegisterMetrics() {
 
 		// Per-pod
 		PodSwapBytes,
-		PodPSIFullAvg10,
+		PodSwapPercent,
+		PodMemoryMax,
 
 		// Config
-		ConfigSwapIOThreshold,
-		ConfigSustainedDuration,
-		ConfigCooldownPeriod,
+		ConfigSwapThresholdPercent,
 		ConfigDryRun,
 	)
 }
@@ -122,5 +94,6 @@ func RegisterMetrics() {
 // ResetPodMetrics clears all per-pod metrics (call before updating)
 func ResetPodMetrics() {
 	PodSwapBytes.Reset()
-	PodPSIFullAvg10.Reset()
+	PodSwapPercent.Reset()
+	PodMemoryMax.Reset()
 }

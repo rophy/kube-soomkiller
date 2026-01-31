@@ -41,16 +41,14 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--swap-io-threshold` | 1000 | Swap I/O rate (pages/sec) to trigger action (must be > 0) |
-| `--sustained-duration` | 10s | How long threshold must be exceeded |
+| `--swap-threshold-percent` | 1 | Kill pods with swap usage > this % of memory limit |
 | `--poll-interval` | 1s | How often to sample /proc/vmstat (minimum 1s) |
-| `--cooldown-period` | 30s | Wait time after killing a pod |
 | `--dry-run` | true | Log actions without executing (also via `DRY_RUN` env var) |
 | `--cgroup-root` | /sys/fs/cgroup | Path to cgroup v2 root |
 | `--metrics-addr` | :8080 | Address to serve Prometheus metrics |
 | `--protected-namespaces` | kube-system | Comma-separated list of namespaces to never kill pods from |
 
-**Note:** With 1s poll interval and 10s sustained duration, the controller requires 10 consecutive samples above threshold before acting. This filters out short spikes while remaining responsive to real pressure.
+**How it works:** When any swap I/O is detected, the controller scans all pods on the node. Pods with `memory.swap.current / memory.max > swap-threshold-percent` are terminated. The threshold is expressed as a percentage of the pod's memory limit.
 
 ### Prometheus Metrics
 
@@ -59,16 +57,14 @@ The controller exposes metrics on `:8080/metrics`:
 | Metric | Type | Description |
 |--------|------|-------------|
 | `soomkiller_swap_io_rate_pages_per_second` | Gauge | Current swap I/O rate |
-| `soomkiller_swap_io_threshold_exceeded` | Gauge | 1 if threshold exceeded, 0 otherwise |
-| `soomkiller_swap_io_threshold_exceeded_duration_seconds` | Gauge | How long threshold has been exceeded |
-| `soomkiller_cooldown_remaining_seconds` | Gauge | Seconds remaining in cooldown |
 | `soomkiller_pods_killed_total` | Counter | Total pods killed |
 | `soomkiller_last_kill_timestamp_seconds` | Gauge | Unix timestamp of last pod kill |
 | `soomkiller_candidate_pods_count` | Gauge | Pods currently using swap |
 | `soomkiller_pod_swap_bytes{namespace,pod}` | Gauge | Swap usage per pod |
-| `soomkiller_pod_psi_full_avg10{namespace,pod}` | Gauge | PSI value per pod |
-
-Configuration metrics (`soomkiller_config_*`) are also exposed for visibility.
+| `soomkiller_pod_swap_percent{namespace,pod}` | Gauge | Swap usage as % of memory limit per pod |
+| `soomkiller_pod_memory_max_bytes{namespace,pod}` | Gauge | Memory limit per pod |
+| `soomkiller_config_swap_threshold_percent` | Gauge | Configured swap threshold % |
+| `soomkiller_config_dry_run` | Gauge | 1 if dry-run mode, 0 otherwise |
 
 **Health endpoint:** `/healthz` returns `ok` when healthy.
 
@@ -271,18 +267,16 @@ Monitor node-level swap I/O and proactively terminate pods under memory pressure
 │   ├── pswpin:  pages swapped in                             │
 │   └── pswpout: pages swapped out                            │
 │          │                                                  │
-│          │ swap_io_rate > threshold                         │
-│          │ for sustained_duration                           │
+│          │ swap_io_rate > 0 (any swap activity)             │
 │          ▼                                                  │
 │   ┌─────────────────┐      ┌─────────────────────────────┐  │
 │   │   Controller    │      │  Per-pod metrics (cgroup)   │  │
 │   │   (DaemonSet)   │◀────▶│  - memory.swap.current      │  │
-│   └────────┬────────┘      │  - memory.pressure (PSI)    │  │
+│   └────────┬────────┘      │  - memory.max               │  │
 │            │               └─────────────────────────────┘  │
 │            │                                                │
-│            │ Select victim:                                 │
-│            │   where swap_usage > 0 AND psi > 0             │
-│            │   max by psi_full_avg10                        │
+│            │ Kill all pods where:                           │
+│            │   swap.current / memory.max > threshold        │
 │            ▼                                                │
 │   ┌─────────────────┐                                       │
 │   │ kubectl delete  │──▶ SIGTERM ──▶ Grace Period ──▶ Clean │
@@ -312,23 +306,25 @@ swap_io_rate = (pswpin_delta + pswpout_delta) / interval
 ### 2. Trigger Condition
 
 ```
-swap_io_rate > swap_io_threshold
-  for duration > sustained_duration
+swap_io_rate > 0
 ```
 
-When swap I/O exceeds the threshold for a sustained period, the node is under memory pressure and action is needed.
+Any swap activity indicates memory pressure. The controller then scans all pods to find those exceeding the threshold.
 
-### 3. Pod Selection
+### 3. Pod Selection and Termination
 
 ```
-candidate_pods = pods where (swap_usage > 0 AND psi_full_avg10 > 0)
-victim = max(candidate_pods, key=psi_full_avg10)
+for each pod:
+  swap_percent = memory.swap.current / memory.max * 100
+  if swap_percent > swap_threshold_percent:
+    delete pod
 ```
 
-Select the pod with:
-1. Non-zero swap usage (actively using swap)
-2. Non-zero PSI (experiencing memory pressure)
-3. Highest PSI `full` value among candidates (most severe memory stalls)
+Kill all pods where:
+1. Swap usage exceeds the configured threshold (% of memory limit)
+2. Pod is not in a protected namespace
+
+**Key insight:** Any swap usage means the pod exceeded its memory limit and would have been OOMKilled without swap. The threshold provides a buffer for edge cases (e.g., 1 byte swap).
 
 ### 4. Graceful Termination
 
@@ -342,26 +338,19 @@ Using `kubectl delete` because:
 - Respects pod's `terminationGracePeriodSeconds`
 - Controller only needs K8s API access
 
-### 5. Cooldown
-
-After killing a pod, the controller waits for `cooldown-period` before taking further action. This:
-- Gives the system time to stabilize
-- Allows the killed pod's memory to be reclaimed
-- Prevents cascading failures from killing too many pods
-
 ## Why This Works
 
-### Traditional OOM Kill
+### Traditional OOM Kill (without swap)
 ```
 Memory limit hit → SIGKILL → Immediate death
 ```
 
-### Soft OOM Kill
+### Soft OOM Kill (with swap + soomkiller)
 ```
-Memory limit hit → Swap thrashing → Controller detects → kubectl delete → SIGTERM → Grace period → Clean shutdown
+Memory limit hit → Swap used → Controller detects → kubectl delete → SIGTERM → Grace period → Clean shutdown
 ```
 
-**Key insight:** Thrashing itself provides the buffer time. When a pod is swapping heavily, it's stalled on I/O - not progressing. This gives the controller time to detect the pressure and act before the system becomes unresponsive.
+**Key insight:** Any swap usage means the pod exceeded its memory limit. Without swap, this would have been an immediate OOMKill. With swap, the controller can detect this and terminate the pod gracefully.
 
 ## Metrics Explained
 
@@ -376,7 +365,7 @@ pswpout 67890
 - `pswpin`: Pages read from swap (cumulative)
 - `pswpout`: Pages written to swap (cumulative)
 
-Sample every second, calculate delta. High sustained rates indicate memory pressure.
+Sampled every second, delta calculated. Any rate > 0 triggers pod scanning.
 
 ### PSI (Pressure Stall Information)
 
@@ -443,34 +432,25 @@ swapon /dev/sdb
 
 This isolates swap I/O from the root filesystem, preventing swap activity from starving kubelet, etcd, and other control plane components.
 
-### Tuning Parameters
+### Tuning the Threshold
 
-| Scenario | swap-io-threshold | sustained-duration |
-|----------|------------------|-------------------|
-| Conservative | 500 pages/sec | 15s |
-| Balanced | 1000 pages/sec | 10s |
-| Aggressive | 2000 pages/sec | 5s |
+| Scenario | swap-threshold-percent | Description |
+|----------|------------------------|-------------|
+| Aggressive | 0.1% | Kill pods at first sign of swap |
+| Balanced | 1% (default) | Allow minor swap before killing |
+| Conservative | 5% | Allow more swap headroom |
 
-Start conservative and tune based on your workload characteristics.
+Start with the default (1%) and adjust based on your workload characteristics. Lower values are more aggressive but may kill pods prematurely for brief memory spikes.
 
 ## Limitations
 
 ### Per-Pod Swap I/O Attribution
 
 cgroup v2 does not expose per-cgroup `pswpin`/`pswpout` counters. We use:
-- Node-level swap I/O for trigger
-- Per-pod PSI + swap usage for victim selection
+- Node-level swap I/O as trigger (any swap activity)
+- Per-pod `memory.swap.current` / `memory.max` for threshold-based kill
 
-This means we detect node pressure, then infer the worst offender from cgroup metrics.
-
-### PSI vs Swap I/O
-
-PSI measures memory pressure broadly, not just swap I/O. A pod may have high PSI from:
-- Page cache reclaim
-- Direct reclaim
-- Memory compaction
-
-We mitigate this by requiring `swap_usage > 0` for victim selection.
+This means we detect node-level swap activity, then check each pod's swap usage as a percentage of its memory limit.
 
 ### Single Point of Failure
 

@@ -34,6 +34,7 @@ type PodMetrics struct {
 	CgroupPath    string
 	SwapCurrent   int64 // bytes
 	MemoryCurrent int64 // bytes
+	MemoryMax     int64 // bytes (memory.max limit)
 	PSI           PSI
 }
 
@@ -192,6 +193,13 @@ func (c *Collector) GetPodMetrics(cgroupPath string) (*PodMetrics, error) {
 	}
 	metrics.MemoryCurrent = memoryCurrent
 
+	// Read memory.max
+	memoryMax, err := readMemoryMax(filepath.Join(fullPath, "memory.max"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read memory.max: %w", err)
+	}
+	metrics.MemoryMax = memoryMax
+
 	// Read memory.pressure (PSI)
 	psi, err := c.readPSI(filepath.Join(fullPath, "memory.pressure"))
 	if err != nil {
@@ -265,4 +273,18 @@ func readInt64File(path string) (int64, error) {
 		return 0, err
 	}
 	return strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+}
+
+// readMemoryMax reads memory.max which can be a number or "max" (unlimited)
+func readMemoryMax(path string) (int64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	content := strings.TrimSpace(string(data))
+	if content == "max" {
+		// Return a very large value for unlimited
+		return 1 << 62, nil // ~4 exabytes
+	}
+	return strconv.ParseInt(content, 10, 64)
 }

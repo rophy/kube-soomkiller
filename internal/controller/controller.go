@@ -16,15 +16,13 @@ import (
 
 // Config holds controller configuration
 type Config struct {
-	NodeName            string
-	PollInterval        time.Duration
-	SwapIOThreshold     int           // pages/sec to trigger action
-	SustainedDuration   time.Duration // how long threshold must be exceeded
-	CooldownPeriod      time.Duration // wait time after killing a pod
-	DryRun              bool
-	ProtectedNamespaces []string // namespaces to never kill pods from
-	K8sClient           kubernetes.Interface
-	Metrics             *metrics.Collector
+	NodeName             string
+	PollInterval         time.Duration
+	SwapThresholdPercent float64 // Kill pods with swap > this % of memory.max
+	DryRun               bool
+	ProtectedNamespaces  []string // namespaces to never kill pods from
+	K8sClient            kubernetes.Interface
+	Metrics              *metrics.Collector
 }
 
 // Controller monitors swap pressure and terminates pods when necessary
@@ -32,19 +30,11 @@ type Controller struct {
 	config Config
 
 	// State tracking
-	lastSwapIO        *metrics.SwapIOStats
-	lastSampleTime    time.Time
-	thresholdExceeded time.Time // when threshold was first exceeded
-	lastKillTime      time.Time // when we last killed a pod
-
-	// API error backoff state
-	consecutiveAPIErrors int
-	lastAPIErrorTime     time.Time
+	lastSwapIO     *metrics.SwapIOStats
+	lastSampleTime time.Time
 
 	// Logging state (to reduce log frequency)
 	lastStatusLogTime time.Time
-	lastLoggedRate    float64
-	lastRateAbove     bool // was rate above threshold on last check
 
 	// Protected namespaces (precomputed as map for O(1) lookup)
 	protectedNamespaces map[string]bool
@@ -52,18 +42,13 @@ type Controller struct {
 
 // PodCandidate represents a pod that may be terminated
 type PodCandidate struct {
-	Namespace    string
-	Name         string
-	CgroupPath   string
-	SwapBytes    int64
-	PSIFullAvg10 float64
+	Namespace   string
+	Name        string
+	CgroupPath  string
+	SwapBytes   int64
+	MemoryMax   int64
+	SwapPercent float64 // SwapBytes / MemoryMax * 100
 }
-
-// Constants for exponential backoff
-const (
-	maxBackoffDuration = 60 * time.Second
-	baseBackoffDuration = 1 * time.Second
-)
 
 // New creates a new controller
 func New(config Config) *Controller {
@@ -79,51 +64,10 @@ func New(config Config) *Controller {
 	}
 }
 
-// calculateBackoff returns the backoff duration based on consecutive errors
-func (c *Controller) calculateBackoff() time.Duration {
-	if c.consecutiveAPIErrors == 0 {
-		return 0
-	}
-	// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped)
-	backoff := baseBackoffDuration * time.Duration(1<<(c.consecutiveAPIErrors-1))
-	if backoff > maxBackoffDuration {
-		backoff = maxBackoffDuration
-	}
-	return backoff
-}
-
-// shouldLogStatus returns true if we should log the current status.
-// Logs every 30s, or when rate crosses threshold, or changes significantly (>50%).
-func (c *Controller) shouldLogStatus(rate float64, now time.Time) bool {
-	threshold := float64(c.config.SwapIOThreshold)
-	rateAbove := rate >= threshold
-
-	// Always log if threshold crossing changed
-	if rateAbove != c.lastRateAbove {
-		return true
-	}
-
-	// Log if rate changed significantly (>50% relative change)
-	if c.lastLoggedRate > 0 {
-		change := (rate - c.lastLoggedRate) / c.lastLoggedRate
-		if change > 0.5 || change < -0.5 {
-			return true
-		}
-	}
-
-	// Log every 30 seconds
-	if now.Sub(c.lastStatusLogTime) >= 30*time.Second {
-		return true
-	}
-
-	return false
-}
-
 // Run starts the controller main loop
 func (c *Controller) Run(ctx context.Context) error {
 	klog.Infof("Controller started, polling every %s", c.config.PollInterval)
-	klog.Infof("Trigger: swap I/O > %d pages/sec for %s",
-		c.config.SwapIOThreshold, c.config.SustainedDuration)
+	klog.Infof("Trigger: pod swap usage > %.1f%% of memory limit", c.config.SwapThresholdPercent)
 	if len(c.config.ProtectedNamespaces) > 0 {
 		klog.Infof("Protected namespaces (will not kill pods from): %v", c.config.ProtectedNamespaces)
 	}
@@ -170,16 +114,6 @@ func (c *Controller) checkCgroupsAtStartup() {
 func (c *Controller) reconcile(ctx context.Context) error {
 	now := time.Now()
 
-	// Check if we're in API error backoff
-	if c.consecutiveAPIErrors > 0 {
-		backoff := c.calculateBackoff()
-		if now.Sub(c.lastAPIErrorTime) < backoff {
-			klog.V(2).Infof("In API error backoff (%s remaining), skipping reconcile",
-				(backoff - now.Sub(c.lastAPIErrorTime)).Round(time.Second))
-			return nil
-		}
-	}
-
 	// Get current swap I/O stats
 	swapIO, err := c.config.Metrics.GetSwapIOStats()
 	if err != nil {
@@ -204,77 +138,28 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	// Update Prometheus metrics
 	metrics.SwapIORate.Set(swapIORate)
 
-	// Determine if we should log status (every 30s, or on significant change)
-	rateAbove := swapIORate >= float64(c.config.SwapIOThreshold)
-	shouldLog := c.shouldLogStatus(swapIORate, now)
-
-	// Check if in cooldown period
-	if !c.lastKillTime.IsZero() && now.Sub(c.lastKillTime) < c.config.CooldownPeriod {
-		remaining := c.config.CooldownPeriod - now.Sub(c.lastKillTime)
-		metrics.CooldownRemaining.Set(remaining.Seconds())
-		if shouldLog {
-			klog.V(2).Infof("Swap I/O rate=%.1f pages/sec, in cooldown (%s remaining)",
-				swapIORate, remaining.Round(time.Second))
-			c.lastStatusLogTime = now
-			c.lastLoggedRate = swapIORate
-			c.lastRateAbove = rateAbove
-		}
-		return nil
+	// Log status periodically (every 30s)
+	if now.Sub(c.lastStatusLogTime) >= 30*time.Second {
+		klog.V(2).Infof("Swap I/O rate=%.1f pages/sec", swapIORate)
+		c.lastStatusLogTime = now
 	}
-	metrics.CooldownRemaining.Set(0)
 
-	// Check if swap I/O rate exceeds threshold
-	if swapIORate < float64(c.config.SwapIOThreshold) {
-		// Reset threshold exceeded time
-		c.thresholdExceeded = time.Time{}
-		metrics.SwapIOThresholdExceeded.Set(0)
-		metrics.SwapIOThresholdExceededDuration.Set(0)
-		if shouldLog {
-			klog.V(2).Infof("Swap I/O rate=%.1f pages/sec (threshold=%d), idle",
-				swapIORate, c.config.SwapIOThreshold)
-			c.lastStatusLogTime = now
-			c.lastLoggedRate = swapIORate
-			c.lastRateAbove = rateAbove
-		}
+	// No swap activity = nothing to do
+	if swapIORate == 0 {
 		return nil
 	}
 
-	// Threshold exceeded
-	metrics.SwapIOThresholdExceeded.Set(1)
+	klog.V(1).Infof("Swap I/O detected: %.1f pages/sec, scanning pods", swapIORate)
 
-	// Threshold exceeded - track when it started
-	if c.thresholdExceeded.IsZero() {
-		c.thresholdExceeded = now
-		klog.Infof("Swap I/O threshold exceeded: %.1f pages/sec >= %d threshold",
-			swapIORate, c.config.SwapIOThreshold)
-	}
+	// Find and kill pods over threshold
+	return c.findAndKillOverThreshold(ctx)
+}
 
-	// Check if sustained long enough
-	sustainedFor := now.Sub(c.thresholdExceeded)
-	metrics.SwapIOThresholdExceededDuration.Set(sustainedFor.Seconds())
-
-	if sustainedFor < c.config.SustainedDuration {
-		klog.Infof("Threshold exceeded for %s (need %s), waiting...",
-			sustainedFor.Round(time.Second), c.config.SustainedDuration)
-		return nil
-	}
-
-	klog.Warningf("Swap I/O threshold exceeded for %s: %.1f pages/sec >= %d threshold",
-		sustainedFor.Round(time.Second), swapIORate, c.config.SwapIOThreshold)
-
-	// Find pods using swap
+func (c *Controller) findAndKillOverThreshold(ctx context.Context) error {
 	candidates, err := c.findCandidates(ctx)
 	if err != nil {
-		// Track consecutive API errors for exponential backoff
-		c.consecutiveAPIErrors++
-		c.lastAPIErrorTime = now
-		backoff := c.calculateBackoff()
-		klog.Warningf("Failed to find candidates (attempt %d, next retry in %s): %v",
-			c.consecutiveAPIErrors, backoff, err)
-		return nil // Don't propagate error, we'll retry with backoff
+		return err
 	}
-	// Reset error count on success
-	c.consecutiveAPIErrors = 0
 
 	// Update candidate count metric
 	metrics.CandidatePodsCount.Set(float64(len(candidates)))
@@ -283,38 +168,56 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	metrics.ResetPodMetrics()
 	for _, cand := range candidates {
 		metrics.PodSwapBytes.WithLabelValues(cand.Namespace, cand.Name).Set(float64(cand.SwapBytes))
-		metrics.PodPSIFullAvg10.WithLabelValues(cand.Namespace, cand.Name).Set(cand.PSIFullAvg10)
+		metrics.PodSwapPercent.WithLabelValues(cand.Namespace, cand.Name).Set(cand.SwapPercent)
+		metrics.PodMemoryMax.WithLabelValues(cand.Namespace, cand.Name).Set(float64(cand.MemoryMax))
 	}
 
 	if len(candidates) == 0 {
-		klog.Warning("Swap I/O is high but no pods using swap found")
+		klog.V(2).Info("No pods using swap")
 		return nil
 	}
 
-	// Select victim (highest PSI full avg10 among swap users, with swap as tiebreaker)
-	victim := c.selectVictim(candidates)
-	if victim == nil {
-		klog.Warning("Swap I/O is high but no pods have both swap > 0 and PSI > 0")
-		return nil
+	// Log all candidates
+	klog.Infof("Found %d pods using swap:", len(candidates))
+	for _, cand := range candidates {
+		overThreshold := ""
+		if cand.SwapPercent > c.config.SwapThresholdPercent {
+			overThreshold = " [OVER THRESHOLD]"
+		}
+		klog.Infof("  %s/%s: swap=%.1f%% (%.1fMB / %.1fMB limit)%s",
+			cand.Namespace, cand.Name, cand.SwapPercent,
+			float64(cand.SwapBytes)/1024/1024,
+			float64(cand.MemoryMax)/1024/1024,
+			overThreshold)
 	}
 
-	klog.Warningf("Selected victim: %s/%s (swap=%d MB, PSI full avg10=%.2f)",
-		victim.Namespace, victim.Name, victim.SwapBytes/1024/1024, victim.PSIFullAvg10)
+	// Kill pods over threshold (sorted by swap percent descending)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].SwapPercent > candidates[j].SwapPercent
+	})
 
-	// Terminate the pod
-	if err := c.terminatePod(ctx, *victim); err != nil {
-		return fmt.Errorf("failed to terminate pod: %w", err)
+	var killed int
+	for _, cand := range candidates {
+		if cand.SwapPercent <= c.config.SwapThresholdPercent {
+			break // Sorted, so remaining are also under threshold
+		}
+
+		klog.Warningf("Pod %s/%s over threshold: swap=%.1f%% > %.1f%%",
+			cand.Namespace, cand.Name, cand.SwapPercent, c.config.SwapThresholdPercent)
+
+		if err := c.terminatePod(ctx, cand); err != nil {
+			klog.Errorf("Failed to kill pod %s/%s: %v",
+				cand.Namespace, cand.Name, err)
+			continue
+		}
+		killed++
 	}
 
-	// Update state after successful kill
-	c.lastKillTime = now
-	c.thresholdExceeded = time.Time{} // Reset to re-evaluate after cooldown
-
-	// Update Prometheus metrics
-	metrics.PodsKilledTotal.Inc()
-	metrics.LastKillTimestamp.Set(float64(now.Unix()))
-	metrics.SwapIOThresholdExceeded.Set(0)
-	metrics.SwapIOThresholdExceededDuration.Set(0)
+	if killed > 0 {
+		klog.Infof("Killed %d pods over swap threshold", killed)
+		metrics.PodsKilledTotal.Add(float64(killed))
+		metrics.LastKillTimestamp.Set(float64(time.Now().Unix()))
+	}
 
 	return nil
 }
@@ -379,17 +282,6 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 		return nil, nil
 	}
 
-	// Warn about unrecognized cgroup patterns
-	if len(cgroupsResult.Unrecognized) > 0 {
-		// Show up to 3 examples to avoid log spam
-		examples := cgroupsResult.Unrecognized
-		if len(examples) > 3 {
-			examples = examples[:3]
-		}
-		klog.Warningf("Found %d unrecognized cgroup patterns (not cri-containerd-* or crio-*): %v",
-			len(cgroupsResult.Unrecognized), examples)
-	}
-
 	// Track processed pods to avoid duplicates (multiple containers per pod)
 	processedPods := make(map[string]*PodCandidate)
 
@@ -417,20 +309,32 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 			continue
 		}
 
+		// Calculate swap percentage
+		var swapPercent float64
+		if podMetrics.MemoryMax > 0 {
+			swapPercent = float64(podMetrics.SwapCurrent) / float64(podMetrics.MemoryMax) * 100
+		}
+
 		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 		if existing, ok := processedPods[podKey]; ok {
 			// Aggregate metrics across containers in the same pod
 			existing.SwapBytes += podMetrics.SwapCurrent
-			if podMetrics.PSI.FullAvg10 > existing.PSIFullAvg10 {
-				existing.PSIFullAvg10 = podMetrics.PSI.FullAvg10
+			// Take max memory.max across containers
+			if podMetrics.MemoryMax > existing.MemoryMax {
+				existing.MemoryMax = podMetrics.MemoryMax
+			}
+			// Recalculate percent with aggregated values
+			if existing.MemoryMax > 0 {
+				existing.SwapPercent = float64(existing.SwapBytes) / float64(existing.MemoryMax) * 100
 			}
 		} else {
 			processedPods[podKey] = &PodCandidate{
-				Namespace:    pod.Namespace,
-				Name:         pod.Name,
-				CgroupPath:   cgroupPath,
-				SwapBytes:    podMetrics.SwapCurrent,
-				PSIFullAvg10: podMetrics.PSI.FullAvg10,
+				Namespace:   pod.Namespace,
+				Name:        pod.Name,
+				CgroupPath:  cgroupPath,
+				SwapBytes:   podMetrics.SwapCurrent,
+				MemoryMax:   podMetrics.MemoryMax,
+				SwapPercent: swapPercent,
 			}
 		}
 	}
@@ -484,42 +388,6 @@ func extractContainerIDFromCgroup(cgroupPath string) string {
 		return fullID[:12]
 	}
 	return fullID
-}
-
-func (c *Controller) selectVictim(candidates []PodCandidate) *PodCandidate {
-	// Filter candidates: must have PSI > 0 (swap > 0 already filtered in findCandidates)
-	var filtered []PodCandidate
-	for _, cand := range candidates {
-		if cand.PSIFullAvg10 > 0 {
-			filtered = append(filtered, cand)
-		}
-	}
-
-	// Log all candidates
-	klog.Infof("Candidates with swap > 0 (%d total, %d with PSI > 0):",
-		len(candidates), len(filtered))
-	for i, cand := range candidates {
-		hasPSI := ""
-		if cand.PSIFullAvg10 > 0 {
-			hasPSI = " *"
-		}
-		klog.Infof("  %d. %s/%s: swap=%d MB, PSI=%.2f%s",
-			i+1, cand.Namespace, cand.Name, cand.SwapBytes/1024/1024, cand.PSIFullAvg10, hasPSI)
-	}
-
-	if len(filtered) == 0 {
-		return nil
-	}
-
-	// Sort by PSI full avg10 (descending), then by swap (descending) as tiebreaker
-	sort.Slice(filtered, func(i, j int) bool {
-		if filtered[i].PSIFullAvg10 != filtered[j].PSIFullAvg10 {
-			return filtered[i].PSIFullAvg10 > filtered[j].PSIFullAvg10
-		}
-		return filtered[i].SwapBytes > filtered[j].SwapBytes
-	})
-
-	return &filtered[0]
 }
 
 func (c *Controller) terminatePod(ctx context.Context, pod PodCandidate) error {

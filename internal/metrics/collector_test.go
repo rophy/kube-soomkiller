@@ -20,6 +20,7 @@ func TestGetPodMetrics(t *testing.T) {
 	files := map[string]string{
 		"memory.swap.current": "104857600", // 100MB
 		"memory.current":      "268435456", // 256MB
+		"memory.max":          "536870912", // 512MB
 		"memory.pressure": `some avg10=5.50 avg60=2.30 avg300=1.10 total=123456
 full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 	}
@@ -46,6 +47,11 @@ full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 		t.Errorf("MemoryCurrent = %d, want 268435456", metrics.MemoryCurrent)
 	}
 
+	// Verify memory max
+	if metrics.MemoryMax != 536870912 {
+		t.Errorf("MemoryMax = %d, want 536870912", metrics.MemoryMax)
+	}
+
 	// Verify PSI
 	if metrics.PSI.SomeAvg10 != 5.50 {
 		t.Errorf("PSI.SomeAvg10 = %f, want 5.50", metrics.PSI.SomeAvg10)
@@ -70,6 +76,7 @@ func TestGetPodMetrics_ZeroSwap(t *testing.T) {
 	files := map[string]string{
 		"memory.swap.current": "0",
 		"memory.current":      "134217728",
+		"memory.max":          "268435456", // 256MB
 		"memory.pressure": `some avg10=0.00 avg60=0.00 avg300=0.00 total=0
 full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 	}
@@ -88,6 +95,42 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 
 	if metrics.SwapCurrent != 0 {
 		t.Errorf("SwapCurrent = %d, want 0", metrics.SwapCurrent)
+	}
+}
+
+func TestGetPodMetrics_UnlimitedMemory(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cgroupPath := "kubepods.slice/cri-containerd-abc123.scope"
+	fullPath := filepath.Join(tmpDir, cgroupPath)
+	if err := os.MkdirAll(fullPath, 0755); err != nil {
+		t.Fatalf("Failed to create test directory: %v", err)
+	}
+
+	files := map[string]string{
+		"memory.swap.current": "0",
+		"memory.current":      "134217728",
+		"memory.max":          "max", // unlimited
+		"memory.pressure": `some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
+	}
+
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(fullPath, name), []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write test file: %v", err)
+		}
+	}
+
+	collector := NewCollector(tmpDir)
+	metrics, err := collector.GetPodMetrics(cgroupPath)
+	if err != nil {
+		t.Fatalf("GetPodMetrics() error = %v", err)
+	}
+
+	// memory.max = "max" should return 1<<62 (~4 exabytes)
+	expected := int64(1 << 62)
+	if metrics.MemoryMax != expected {
+		t.Errorf("MemoryMax = %d, want %d (1<<62)", metrics.MemoryMax, expected)
 	}
 }
 

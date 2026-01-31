@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/rophy/kube-soomkiller/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
@@ -15,183 +14,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
-
-func TestSelectVictim(t *testing.T) {
-	tests := []struct {
-		name       string
-		candidates []PodCandidate
-		wantPod    string
-		wantNS     string
-		wantNil    bool
-	}{
-		{
-			name: "single candidate with PSI > 0",
-			candidates: []PodCandidate{
-				{Namespace: "default", Name: "only-pod", PSIFullAvg10: 5.0, SwapBytes: 100 * 1024 * 1024},
-			},
-			wantNS:  "default",
-			wantPod: "only-pod",
-		},
-		{
-			name: "selects highest PSI",
-			candidates: []PodCandidate{
-				{Namespace: "default", Name: "low-psi", PSIFullAvg10: 1.0, SwapBytes: 100 << 20},
-				{Namespace: "default", Name: "high-psi", PSIFullAvg10: 10.0, SwapBytes: 50 << 20},
-				{Namespace: "default", Name: "mid-psi", PSIFullAvg10: 5.0, SwapBytes: 200 << 20},
-			},
-			wantNS:  "default",
-			wantPod: "high-psi",
-		},
-		{
-			name: "PSI takes priority over swap size",
-			candidates: []PodCandidate{
-				{Namespace: "default", Name: "big-swap-low-psi", PSIFullAvg10: 2.0, SwapBytes: 500 << 20},
-				{Namespace: "default", Name: "small-swap-high-psi", PSIFullAvg10: 15.0, SwapBytes: 10 << 20},
-			},
-			wantNS:  "default",
-			wantPod: "small-swap-high-psi",
-		},
-		{
-			name: "equal PSI uses swap as tiebreaker",
-			candidates: []PodCandidate{
-				{Namespace: "ns-a", Name: "pod-a", PSIFullAvg10: 5.0, SwapBytes: 100 << 20},
-				{Namespace: "ns-b", Name: "pod-b", PSIFullAvg10: 5.0, SwapBytes: 200 << 20},
-				{Namespace: "ns-c", Name: "pod-c", PSIFullAvg10: 5.0, SwapBytes: 150 << 20},
-			},
-			wantNS:  "ns-b",
-			wantPod: "pod-b", // highest swap when PSI is equal
-		},
-		{
-			name: "all candidates have PSI = 0 returns nil",
-			candidates: []PodCandidate{
-				{Namespace: "default", Name: "zero-psi-1", PSIFullAvg10: 0.0, SwapBytes: 100 << 20},
-				{Namespace: "default", Name: "zero-psi-2", PSIFullAvg10: 0.0, SwapBytes: 200 << 20},
-			},
-			wantNil: true,
-		},
-		{
-			name: "filters out PSI = 0 candidates",
-			candidates: []PodCandidate{
-				{Namespace: "default", Name: "zero-psi", PSIFullAvg10: 0.0, SwapBytes: 500 << 20},
-				{Namespace: "default", Name: "has-psi", PSIFullAvg10: 1.0, SwapBytes: 50 << 20},
-			},
-			wantNS:  "default",
-			wantPod: "has-psi",
-		},
-		{
-			name: "very small PSI differences",
-			candidates: []PodCandidate{
-				{Namespace: "default", Name: "psi-low", PSIFullAvg10: 0.001, SwapBytes: 100 << 20},
-				{Namespace: "default", Name: "psi-high", PSIFullAvg10: 0.002, SwapBytes: 100 << 20},
-			},
-			wantNS:  "default",
-			wantPod: "psi-high",
-		},
-		{
-			name: "mixed namespaces",
-			candidates: []PodCandidate{
-				{Namespace: "kube-system", Name: "system-pod", PSIFullAvg10: 3.0, SwapBytes: 50 << 20},
-				{Namespace: "production", Name: "app-pod", PSIFullAvg10: 8.0, SwapBytes: 150 << 20},
-				{Namespace: "staging", Name: "test-pod", PSIFullAvg10: 12.0, SwapBytes: 80 << 20},
-			},
-			wantNS:  "staging",
-			wantPod: "test-pod",
-		},
-		{
-			name: "large candidate list with mixed PSI",
-			candidates: func() []PodCandidate {
-				candidates := make([]PodCandidate, 100)
-				for i := 0; i < 100; i++ {
-					candidates[i] = PodCandidate{
-						Namespace:    "default",
-						Name:         "pod-" + string(rune('a'+i%26)) + string(rune('0'+i/26)),
-						PSIFullAvg10: float64(i), // pod-a0 has PSI=0, filtered out
-						SwapBytes:    int64(i << 20),
-					}
-				}
-				// Add the highest PSI pod in the middle
-				candidates[50] = PodCandidate{
-					Namespace:    "default",
-					Name:         "highest-psi-pod",
-					PSIFullAvg10: 999.0,
-					SwapBytes:    1 << 20,
-				}
-				return candidates
-			}(),
-			wantNS:  "default",
-			wantPod: "highest-psi-pod",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Controller{}
-			got := c.selectVictim(tt.candidates)
-			if tt.wantNil {
-				if got != nil {
-					t.Errorf("selectVictim() = %s/%s, want nil", got.Namespace, got.Name)
-				}
-				return
-			}
-			if got == nil {
-				t.Errorf("selectVictim() = nil, want %s/%s", tt.wantNS, tt.wantPod)
-				return
-			}
-			if got.Namespace != tt.wantNS || got.Name != tt.wantPod {
-				t.Errorf("selectVictim() = %s/%s, want %s/%s",
-					got.Namespace, got.Name, tt.wantNS, tt.wantPod)
-			}
-		})
-	}
-}
-
-func TestSelectVictimStability(t *testing.T) {
-	// Test that repeated calls with same input produce same output
-	candidates := []PodCandidate{
-		{Namespace: "default", Name: "pod-a", PSIFullAvg10: 5.0, SwapBytes: 100 << 20},
-		{Namespace: "default", Name: "pod-b", PSIFullAvg10: 10.0, SwapBytes: 200 << 20},
-		{Namespace: "default", Name: "pod-c", PSIFullAvg10: 7.0, SwapBytes: 150 << 20},
-	}
-
-	c := &Controller{}
-
-	// Run multiple times to verify deterministic behavior
-	var firstResult *PodCandidate
-	for i := 0; i < 100; i++ {
-		// Make a copy to avoid sort affecting original
-		candidatesCopy := make([]PodCandidate, len(candidates))
-		copy(candidatesCopy, candidates)
-
-		result := c.selectVictim(candidatesCopy)
-		if i == 0 {
-			firstResult = result
-		} else {
-			if result.Name != firstResult.Name || result.Namespace != firstResult.Namespace {
-				t.Errorf("selectVictim() not stable: iteration %d got %s/%s, want %s/%s",
-					i, result.Namespace, result.Name, firstResult.Namespace, firstResult.Name)
-			}
-		}
-	}
-}
-
-func TestSelectVictimSwapTiebreaker(t *testing.T) {
-	// When PSI values are equal, swap should be used as tiebreaker
-	candidates := []PodCandidate{
-		{Namespace: "default", Name: "small-swap", PSIFullAvg10: 5.0, SwapBytes: 50 << 20},
-		{Namespace: "default", Name: "large-swap", PSIFullAvg10: 5.0, SwapBytes: 200 << 20},
-		{Namespace: "default", Name: "medium-swap", PSIFullAvg10: 5.0, SwapBytes: 100 << 20},
-	}
-
-	c := &Controller{}
-
-	result := c.selectVictim(candidates)
-	if result == nil {
-		t.Fatal("selectVictim() returned nil")
-	}
-	if result.Name != "large-swap" {
-		t.Errorf("selectVictim() = %s, want large-swap (highest swap when PSI equal)", result.Name)
-	}
-}
 
 func TestExtractContainerIDFromCgroup(t *testing.T) {
 	tests := []struct {
@@ -300,7 +122,7 @@ func TestExtractContainerIDFromStatus(t *testing.T) {
 }
 
 // Helper to create a fake cgroup with metrics
-func createFakeCgroup(t *testing.T, cgroupRoot, cgroupPath string, swapBytes int64, psiFullAvg10 float64) {
+func createFakeCgroup(t *testing.T, cgroupRoot, cgroupPath string, swapBytes, memoryMax int64) {
 	t.Helper()
 	fullPath := filepath.Join(cgroupRoot, cgroupPath)
 	if err := os.MkdirAll(fullPath, 0755); err != nil {
@@ -310,8 +132,9 @@ func createFakeCgroup(t *testing.T, cgroupRoot, cgroupPath string, swapBytes int
 	files := map[string]string{
 		"memory.swap.current": fmt.Sprintf("%d", swapBytes),
 		"memory.current":      "268435456",
-		"memory.pressure": fmt.Sprintf(`some avg10=1.00 avg60=1.00 avg300=1.00 total=1000
-full avg10=%.2f avg60=1.00 avg300=1.00 total=1000`, psiFullAvg10),
+		"memory.max":          fmt.Sprintf("%d", memoryMax),
+		"memory.pressure": `some avg10=1.00 avg60=1.00 avg300=1.00 total=1000
+full avg10=1.00 avg60=1.00 avg300=1.00 total=1000`,
 	}
 
 	for name, content := range files {
@@ -433,10 +256,9 @@ func TestFindCandidates_QoSFiltering(t *testing.T) {
 	bestEffortContainerID := "ccc111222333444555666777888999000111222333444555666777888999000111"
 
 	// Create cgroups with realistic kubelet path structure
-	// Format: kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice/cri-containerd-<id>.scope
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+burstableContainerID+".scope", 100<<20, 5.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-guaranteed.slice/kubepods-guaranteed-podbbb.slice/cri-containerd-"+guaranteedContainerID+".scope", 100<<20, 5.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podccc.slice/cri-containerd-"+bestEffortContainerID+".scope", 100<<20, 5.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+burstableContainerID+".scope", 100<<20, 512<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-guaranteed.slice/kubepods-guaranteed-podbbb.slice/cri-containerd-"+guaranteedContainerID+".scope", 100<<20, 512<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podccc.slice/cri-containerd-"+bestEffortContainerID+".scope", 100<<20, 512<<20)
 
 	// Create fake K8s client with pods of different QoS classes
 	fakeClient := fake.NewSimpleClientset(
@@ -480,9 +302,9 @@ func TestFindCandidates_SwapZeroFiltering(t *testing.T) {
 	withSwapContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
 	noSwapContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
 
-	// Create cgroups with realistic path structure - one with swap, one without
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+withSwapContainerID+".scope", 100<<20, 5.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podbbb.slice/cri-containerd-"+noSwapContainerID+".scope", 0, 5.0) // swap=0
+	// Create cgroups - one with swap, one without
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+withSwapContainerID+".scope", 100<<20, 512<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podbbb.slice/cri-containerd-"+noSwapContainerID+".scope", 0, 512<<20) // swap=0
 
 	// Create fake K8s client - both pods are Burstable
 	fakeClient := fake.NewSimpleClientset(
@@ -514,6 +336,47 @@ func TestFindCandidates_SwapZeroFiltering(t *testing.T) {
 
 	if candidates[0].Name != "with-swap-pod" {
 		t.Errorf("findCandidates() candidate = %s, want with-swap-pod", candidates[0].Name)
+	}
+}
+
+func TestFindCandidates_SwapPercentCalculation(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	containerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+
+	// Create cgroup: 50MB swap, 512MB memory limit = ~9.77% swap usage
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+containerID+".scope", 50<<20, 512<<20)
+
+	fakeClient := fake.NewSimpleClientset(
+		createPod("test-pod", "default", nodeName, corev1.PodQOSBurstable, containerID),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:  nodeName,
+			K8sClient: fakeClient,
+			Metrics:   metrics.NewCollector(tmpDir),
+		},
+	}
+
+	candidates, err := c.findCandidates(context.Background())
+	if err != nil {
+		t.Fatalf("findCandidates() error = %v", err)
+	}
+
+	if len(candidates) != 1 {
+		t.Fatalf("findCandidates() returned %d candidates, want 1", len(candidates))
+	}
+
+	cand := candidates[0]
+	expectedPercent := float64(50<<20) / float64(512<<20) * 100 // ~9.77%
+	if cand.SwapPercent < 9.7 || cand.SwapPercent > 9.8 {
+		t.Errorf("candidate SwapPercent = %.2f, want ~%.2f", cand.SwapPercent, expectedPercent)
+	}
+
+	if cand.MemoryMax != 512<<20 {
+		t.Errorf("candidate MemoryMax = %d, want %d", cand.MemoryMax, 512<<20)
 	}
 }
 
@@ -555,14 +418,12 @@ func TestFindCandidates_PodOnDifferentNode(t *testing.T) {
 	tmpDir := t.TempDir()
 	nodeName := "test-node"
 
-	// Container ID for pod on different node
 	containerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
 
-	// Create cgroup with swap usage (as if the container were on this node)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+containerID+".scope", 100<<20, 5.0)
+	// Create cgroup with swap usage
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+containerID+".scope", 100<<20, 512<<20)
 
 	// Create fake K8s client with pod on DIFFERENT node
-	// Use helper that honors spec.nodeName field selector
 	fakeClient := createFakeClientWithNodeFilter(
 		createPod("remote-pod", "default", "other-node", corev1.PodQOSBurstable, containerID),
 	)
@@ -594,9 +455,9 @@ func TestFindCandidates_MultipleContainersInPod(t *testing.T) {
 	container1ID := "aaa111222333444555666777888999000111222333444555666777888999000111"
 	container2ID := "bbb111222333444555666777888999000111222333444555666777888999000111"
 
-	// Create cgroups for both containers with different swap and PSI values
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+container1ID+".scope", 50<<20, 3.0)  // 50MB swap, PSI=3
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+container2ID+".scope", 100<<20, 8.0) // 100MB swap, PSI=8
+	// Create cgroups for both containers with different swap values
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+container1ID+".scope", 50<<20, 256<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+container2ID+".scope", 100<<20, 512<<20)
 
 	// Create fake K8s client with pod having two containers
 	fakeClient := fake.NewSimpleClientset(
@@ -632,9 +493,9 @@ func TestFindCandidates_MultipleContainersInPod(t *testing.T) {
 		t.Errorf("candidate SwapBytes = %d, want %d (aggregated)", cand.SwapBytes, expectedSwap)
 	}
 
-	// PSI should be the max of both containers (max(3.0, 8.0) = 8.0)
-	if cand.PSIFullAvg10 != 8.0 {
-		t.Errorf("candidate PSIFullAvg10 = %.2f, want 8.0 (max)", cand.PSIFullAvg10)
+	// MemoryMax should be the max (512MB)
+	if cand.MemoryMax != 512<<20 {
+		t.Errorf("candidate MemoryMax = %d, want %d (max)", cand.MemoryMax, 512<<20)
 	}
 }
 
@@ -642,13 +503,12 @@ func TestFindCandidates_CRIORuntime(t *testing.T) {
 	tmpDir := t.TempDir()
 	nodeName := "test-node"
 
-	// Container ID (64 chars, first 12 used for matching)
 	containerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
 
-	// Create cgroup with CRI-O format: crio-<id>.scope (not cri-containerd-)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/crio-"+containerID+".scope", 100<<20, 5.0)
+	// Create cgroup with CRI-O format
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/crio-"+containerID+".scope", 100<<20, 512<<20)
 
-	// Create pod with CRI-O container ID format: cri-o://<id> (not containerd://)
+	// Create pod with CRI-O container ID format
 	fakeClient := fake.NewSimpleClientset(
 		createPodCRIO("crio-pod", "default", nodeName, corev1.PodQOSBurstable, containerID),
 	)
@@ -674,14 +534,9 @@ func TestFindCandidates_CRIORuntime(t *testing.T) {
 	if candidates[0].Name != "crio-pod" {
 		t.Errorf("candidate name = %s, want crio-pod", candidates[0].Name)
 	}
-
-	if candidates[0].SwapBytes != 100<<20 {
-		t.Errorf("candidate SwapBytes = %d, want %d", candidates[0].SwapBytes, 100<<20)
-	}
 }
 
 func TestTerminatePod_DryRun(t *testing.T) {
-	// Create fake client with a pod
 	pod := createPod("test-pod", "default", "test-node", corev1.PodQOSBurstable, "abc123")
 	fakeClient := fake.NewSimpleClientset(pod)
 
@@ -692,13 +547,11 @@ func TestTerminatePod_DryRun(t *testing.T) {
 		},
 	}
 
-	// Call terminatePod
 	err := c.terminatePod(context.Background(), PodCandidate{
 		Namespace: "default",
 		Name:      "test-pod",
 	})
 
-	// Should succeed without error
 	if err != nil {
 		t.Fatalf("terminatePod() unexpected error: %v", err)
 	}
@@ -711,7 +564,6 @@ func TestTerminatePod_DryRun(t *testing.T) {
 }
 
 func TestTerminatePod_ActualDelete(t *testing.T) {
-	// Create fake client with a pod
 	pod := createPod("test-pod", "default", "test-node", corev1.PodQOSBurstable, "abc123")
 	fakeClient := fake.NewSimpleClientset(pod)
 
@@ -728,13 +580,11 @@ func TestTerminatePod_ActualDelete(t *testing.T) {
 		t.Fatalf("pod should exist before deletion: %v", err)
 	}
 
-	// Call terminatePod
 	err = c.terminatePod(context.Background(), PodCandidate{
 		Namespace: "default",
 		Name:      "test-pod",
 	})
 
-	// Should succeed without error
 	if err != nil {
 		t.Fatalf("terminatePod() unexpected error: %v", err)
 	}
@@ -747,7 +597,6 @@ func TestTerminatePod_ActualDelete(t *testing.T) {
 }
 
 func TestTerminatePod_NonExistent(t *testing.T) {
-	// Create fake client with NO pods
 	fakeClient := fake.NewSimpleClientset()
 
 	c := &Controller{
@@ -757,13 +606,11 @@ func TestTerminatePod_NonExistent(t *testing.T) {
 		},
 	}
 
-	// Try to terminate a pod that doesn't exist
 	err := c.terminatePod(context.Background(), PodCandidate{
 		Namespace: "default",
 		Name:      "nonexistent-pod",
 	})
 
-	// Should return an error
 	if err == nil {
 		t.Errorf("terminatePod() should return error for non-existent pod")
 	}
@@ -773,15 +620,14 @@ func TestFindCandidates_ProtectedNamespaces(t *testing.T) {
 	tmpDir := t.TempDir()
 	nodeName := "test-node"
 
-	// Container IDs for pods in different namespaces
 	defaultContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
 	kubeSystemContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
 	monitoringContainerID := "ccc111222333444555666777888999000111222333444555666777888999000111"
 
 	// Create cgroups for all pods
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+defaultContainerID+".scope", 100<<20, 5.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podbbb.slice/cri-containerd-"+kubeSystemContainerID+".scope", 200<<20, 10.0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podccc.slice/cri-containerd-"+monitoringContainerID+".scope", 150<<20, 7.0)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+defaultContainerID+".scope", 100<<20, 512<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podbbb.slice/cri-containerd-"+kubeSystemContainerID+".scope", 200<<20, 512<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podccc.slice/cri-containerd-"+monitoringContainerID+".scope", 150<<20, 512<<20)
 
 	// Create pods in different namespaces
 	fakeClient := fake.NewSimpleClientset(
@@ -816,40 +662,11 @@ func TestFindCandidates_ProtectedNamespaces(t *testing.T) {
 	}
 }
 
-func TestCalculateBackoff(t *testing.T) {
-	c := &Controller{}
-
-	tests := []struct {
-		consecutiveErrors int
-		expectedBackoff   time.Duration
-	}{
-		{0, 0},
-		{1, 1 * time.Second},
-		{2, 2 * time.Second},
-		{3, 4 * time.Second},
-		{4, 8 * time.Second},
-		{5, 16 * time.Second},
-		{6, 32 * time.Second},
-		{7, 60 * time.Second}, // capped at 60s
-		{10, 60 * time.Second}, // still capped
-	}
-
-	for _, tt := range tests {
-		c.consecutiveAPIErrors = tt.consecutiveErrors
-		got := c.calculateBackoff()
-		if got != tt.expectedBackoff {
-			t.Errorf("calculateBackoff() with %d errors = %v, want %v",
-				tt.consecutiveErrors, got, tt.expectedBackoff)
-		}
-	}
-}
-
 func TestNewController_ProtectedNamespacesMap(t *testing.T) {
 	c := New(Config{
 		ProtectedNamespaces: []string{"kube-system", "monitoring", "default"},
 	})
 
-	// Verify the map is built correctly
 	if !c.protectedNamespaces["kube-system"] {
 		t.Error("kube-system should be in protected namespaces")
 	}
@@ -861,5 +678,52 @@ func TestNewController_ProtectedNamespacesMap(t *testing.T) {
 	}
 	if c.protectedNamespaces["other"] {
 		t.Error("other should not be in protected namespaces")
+	}
+}
+
+func TestFindAndKillOverThreshold(t *testing.T) {
+	tmpDir := t.TempDir()
+	nodeName := "test-node"
+
+	// Create pods with different swap percentages
+	lowSwapContainerID := "aaa111222333444555666777888999000111222333444555666777888999000111"
+	highSwapContainerID := "bbb111222333444555666777888999000111222333444555666777888999000111"
+
+	// low-swap: 5MB swap / 512MB limit = ~1%
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podaaa.slice/cri-containerd-"+lowSwapContainerID+".scope", 5<<20, 512<<20)
+	// high-swap: 100MB swap / 512MB limit = ~19.5%
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podbbb.slice/cri-containerd-"+highSwapContainerID+".scope", 100<<20, 512<<20)
+
+	fakeClient := fake.NewSimpleClientset(
+		createPod("low-swap-pod", "default", nodeName, corev1.PodQOSBurstable, lowSwapContainerID),
+		createPod("high-swap-pod", "default", nodeName, corev1.PodQOSBurstable, highSwapContainerID),
+	)
+
+	c := &Controller{
+		config: Config{
+			NodeName:             nodeName,
+			SwapThresholdPercent: 10.0, // 10% threshold
+			DryRun:               false,
+			K8sClient:            fakeClient,
+			Metrics:              metrics.NewCollector(tmpDir),
+		},
+		protectedNamespaces: make(map[string]bool),
+	}
+
+	err := c.findAndKillOverThreshold(context.Background())
+	if err != nil {
+		t.Fatalf("findAndKillOverThreshold() error = %v", err)
+	}
+
+	// high-swap-pod should be deleted (19.5% > 10%)
+	_, err = fakeClient.CoreV1().Pods("default").Get(context.Background(), "high-swap-pod", metav1.GetOptions{})
+	if err == nil {
+		t.Error("high-swap-pod should have been deleted (over threshold)")
+	}
+
+	// low-swap-pod should still exist (~1% < 10%)
+	_, err = fakeClient.CoreV1().Pods("default").Get(context.Background(), "low-swap-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Error("low-swap-pod should still exist (under threshold)")
 	}
 }
