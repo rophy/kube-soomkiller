@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 )
 
@@ -23,6 +24,7 @@ type Config struct {
 	ProtectedNamespaces  []string // namespaces to never kill pods from
 	K8sClient            kubernetes.Interface
 	Metrics              *metrics.Collector
+	EventRecorder        record.EventRecorder // optional, for emitting Kubernetes events
 }
 
 // Controller monitors swap pressure and terminates pods when necessary
@@ -248,6 +250,13 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 			continue
 		}
 
+		// Skip pods that are already being deleted
+		if pod.DeletionTimestamp != nil {
+			klog.V(3).Infof("Skipping pod %s/%s: already being deleted",
+				pod.Namespace, pod.Name)
+			continue
+		}
+
 		// Only consider Burstable pods - they're the only ones that get swap in LimitedSwap mode
 		if pod.Status.QOSClass != corev1.PodQOSBurstable {
 			klog.V(3).Infof("Skipping pod %s/%s: QoS class is %s (not Burstable)",
@@ -390,19 +399,33 @@ func extractContainerIDFromCgroup(cgroupPath string) string {
 	return fullID
 }
 
-func (c *Controller) terminatePod(ctx context.Context, pod PodCandidate) error {
+func (c *Controller) terminatePod(ctx context.Context, cand PodCandidate) error {
 	if c.config.DryRun {
-		klog.Infof("[DRY-RUN] Would delete pod %s/%s", pod.Namespace, pod.Name)
+		klog.Infof("[DRY-RUN] Would delete pod %s/%s", cand.Namespace, cand.Name)
 		return nil
 	}
 
-	klog.Warningf("Deleting pod %s/%s to relieve swap pressure", pod.Namespace, pod.Name)
+	klog.Warningf("Deleting pod %s/%s to relieve swap pressure", cand.Namespace, cand.Name)
 
-	err := c.config.K8sClient.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	// Emit Kubernetes event before deleting (if event recorder is configured)
+	if c.config.EventRecorder != nil {
+		// Get the pod object to attach the event to
+		pod, err := c.config.K8sClient.CoreV1().Pods(cand.Namespace).Get(ctx, cand.Name, metav1.GetOptions{})
+		if err == nil {
+			c.config.EventRecorder.Eventf(pod, corev1.EventTypeWarning, "Soomkilled",
+				"Pod killed by kube-soomkiller: swap usage %.1f%% exceeded threshold %.1f%% (swap: %.1fMB, limit: %.1fMB)",
+				cand.SwapPercent, c.config.SwapThresholdPercent,
+				float64(cand.SwapBytes)/1024/1024, float64(cand.MemoryMax)/1024/1024)
+		} else {
+			klog.V(2).Infof("Could not get pod %s/%s for event: %v", cand.Namespace, cand.Name, err)
+		}
 	}
 
-	klog.Infof("Successfully deleted pod %s/%s", pod.Namespace, pod.Name)
+	err := c.config.K8sClient.CoreV1().Pods(cand.Namespace).Delete(ctx, cand.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to delete pod %s/%s: %w", cand.Namespace, cand.Name, err)
+	}
+
+	klog.Infof("Successfully deleted pod %s/%s", cand.Namespace, cand.Name)
 	return nil
 }

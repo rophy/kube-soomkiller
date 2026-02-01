@@ -6,25 +6,20 @@ setup_suite() {
     local project_root
     project_root="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
 
-    # Deploy the application (allow failure for mariadb scheduling issues)
-    echo "# Deploying kube-soomkiller with skaffold..."
-    (cd "$project_root" && skaffold run --kube-context "${KUBE_CONTEXT:-k3s}" --status-check=false)
+    # Deploy soomkiller + e2e fixtures using skaffold e2e profile
+    echo "# Deploying kube-soomkiller with skaffold (e2e profile)..."
+    (cd "$project_root" && skaffold run --kube-context "${KUBE_CONTEXT:-k3s}" --profile e2e)
 
     # Wait for daemonset
+    echo "# Waiting for daemonset rollout..."
     kubectl --context "${KUBE_CONTEXT:-k3s}" rollout status daemonset/kube-soomkiller \
         -n kube-soomkiller --timeout=120s
 
-    # Wait for at least one mariadb pod to be ready
-    echo "# Waiting for mariadb pods..."
-    kubectl --context "${KUBE_CONTEXT:-k3s}" -n kube-soomkiller wait --for=condition=ready \
-        pod/mariadb-0 --timeout=120s
-
-    # Prepare sysbench (idempotent)
-    echo "# Preparing sysbench tables..."
-    source "$(dirname "$BATS_TEST_FILENAME")/test_helper.bash"
-    sysbench_prepare mariadb-0
+    echo "# Setup complete"
 }
 
 teardown_suite() {
-    : # nothing to cleanup
+    # Cleanup e2e test pods
+    kubectl --context "${KUBE_CONTEXT:-k3s}" delete pod memory-hog \
+        -n kube-soomkiller --ignore-not-found=true 2>/dev/null || true
 }

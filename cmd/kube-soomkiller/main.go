@@ -14,9 +14,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rophy/kube-soomkiller/internal/controller"
 	"github.com/rophy/kube-soomkiller/internal/metrics"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 )
 
@@ -120,6 +124,15 @@ func main() {
 		}
 	}
 
+	// Create event recorder for emitting Kubernetes events
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
+		Interface: k8sClient.CoreV1().Events(""),
+	})
+	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{
+		Component: "kube-soomkiller",
+	})
+
 	// Create controller
 	ctrl := controller.New(controller.Config{
 		NodeName:             nodeName,
@@ -129,6 +142,7 @@ func main() {
 		ProtectedNamespaces:  protectedNSList,
 		K8sClient:            k8sClient,
 		Metrics:              metricsCollector,
+		EventRecorder:        eventRecorder,
 	})
 
 	// Handle shutdown gracefully

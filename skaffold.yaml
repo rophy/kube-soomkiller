@@ -16,6 +16,17 @@ build:
     gitCommit: {}
 manifests:
   rawYaml:
-    - deploy/*.yaml
+    - deploy/soomkiller/*.yaml
 deploy:
   kubectl: {}
+profiles:
+  - name: e2e
+    manifests:
+      rawYaml:
+        - deploy/soomkiller/*.yaml
+        - deploy/e2e/*.yaml
+  - name: stress
+    manifests:
+      rawYaml:
+        - deploy/soomkiller/*.yaml
+        - deploy/stress/*.yaml
