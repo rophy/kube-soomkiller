@@ -2,8 +2,24 @@
 # Core functionality tests for kube-soomkiller v2
 
 setup_file() {
+    load 'test_helper'
+
     # Default timeout for each test (in seconds)
     export BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
+
+    # Deploy soomkiller + e2e fixtures using skaffold e2e profile
+    # skaffold run waits for rollout by default
+    echo "# Deploying kube-soomkiller with skaffold (e2e profile)..."
+    (cd "$(get_project_root)" && skaffold run --kube-context "${KUBE_CONTEXT:-k3s}" --profile e2e)
+
+    echo "# Setup complete"
+}
+
+teardown_file() {
+    load 'test_helper'
+
+    # Cleanup e2e test jobs
+    kubectl delete job memory-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
 }
 
 setup() {
@@ -41,25 +57,13 @@ setup() {
 }
 
 @test "metrics endpoint exposes expected metrics" {
-    local pod
-    pod=$(kubectl get pod -n "$NAMESPACE" -l app=kube-soomkiller -o jsonpath='{.items[0].metadata.name}')
+    # Get soomkiller pod IP
+    local pod_ip
+    pod_ip=$(kubectl get pod -n "$NAMESPACE" -l app=kube-soomkiller -o jsonpath='{.items[0].status.podIP}')
 
-    # Find an available port
-    local port
-    port=$(shuf -i 30000-40000 -n 1)
-
-    # Port-forward and check metrics
-    kubectl port-forward -n "$NAMESPACE" "$pod" "${port}:8080" &
-    local pf_pid=$!
-    sleep 2
-
-    # Fetch metrics
+    # Fetch metrics using the curl pod deployed by e2e profile
     local metrics
-    metrics=$(curl -s "http://localhost:${port}/metrics" 2>/dev/null || true)
-
-    # Cleanup
-    kill $pf_pid 2>/dev/null || true
-    wait $pf_pid 2>/dev/null || true
+    metrics=$(kubectl exec -n "$NAMESPACE" deploy/curl -- curl -s "http://${pod_ip}:8080/metrics" 2>/dev/null || true)
 
     # Check for expected metrics
     local missing=""
@@ -80,25 +84,13 @@ setup() {
 }
 
 @test "health endpoint returns ok" {
-    local pod
-    pod=$(kubectl get pod -n "$NAMESPACE" -l app=kube-soomkiller -o jsonpath='{.items[0].metadata.name}')
+    # Get soomkiller pod IP
+    local pod_ip
+    pod_ip=$(kubectl get pod -n "$NAMESPACE" -l app=kube-soomkiller -o jsonpath='{.items[0].status.podIP}')
 
-    # Find an available port
-    local port
-    port=$(shuf -i 30000-40000 -n 1)
-
-    # Port-forward and check health
-    kubectl port-forward -n "$NAMESPACE" "$pod" "${port}:8080" &
-    local pf_pid=$!
-    sleep 2
-
-    # Check health endpoint
+    # Check health endpoint using the curl pod deployed by e2e profile
     local health
-    health=$(curl -s "http://localhost:${port}/healthz" 2>/dev/null || true)
-
-    # Cleanup
-    kill $pf_pid 2>/dev/null || true
-    wait $pf_pid 2>/dev/null || true
+    health=$(kubectl exec -n "$NAMESPACE" deploy/curl -- curl -s "http://${pod_ip}:8080/healthz" 2>/dev/null || true)
 
     if [[ "$health" != "ok" ]]; then
         echo "ERROR: Health check failed, got: $health"
@@ -108,82 +100,82 @@ setup() {
     echo "# Health endpoint returned ok"
 }
 
-# Note: This test depends on cluster having limited memory to trigger swap.
-# It may be skipped in environments with abundant memory.
-@test "memory pressure triggers swap detection (requires constrained memory)" {
-    # Capture test start time for filtering events
-    local test_start_time
-    test_start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# Critical test: verifies soomkiller detects swap usage and emits Soomkilled event
+@test "memory pressure triggers swap detection and Soomkilled event" {
+    # Delete any existing memory-hog job and wait for cleanup
+    kubectl delete job memory-hog -n "$NAMESPACE" --ignore-not-found=true --wait=true 2>/dev/null || true
 
-    # Delete any existing memory-hog pod
-    kubectl delete pod memory-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-    sleep 2
-
-    # Create fresh memory-hog pod
+    # Create memory-hog job (runs stress command automatically)
     kubectl apply -f "$(get_project_root)/deploy/e2e/memory-hog.yaml"
-    kubectl wait --for=condition=ready pod/memory-hog -n "$NAMESPACE" --timeout=60s
 
-    # Get the node where memory-hog is running
-    local node
-    node=$(kubectl get pod memory-hog -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}')
-    echo "# memory-hog scheduled on node: $node"
+    # Get the pod name created by the job
+    local pod_name=""
+    local attempts=0
+    while [[ -z "$pod_name" && $attempts -lt 10 ]]; do
+        sleep 0.5
+        attempts=$((attempts + 1))
+        pod_name=$(kubectl get pods -n "$NAMESPACE" -l job-name=memory-hog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    done
+    echo "# Pod name: $pod_name"
 
-    # Trigger memory pressure - allocate more than limit to force swap
-    # stress --vm 1 --vm-bytes 300M will try to allocate 300MB against 256MB limit
-    kubectl exec -n "$NAMESPACE" memory-hog -- timeout 20 stress --vm 1 --vm-bytes 300M --vm-keep 2>/dev/null || true
-
-    # Give controller time to detect
-    sleep 3
-
-    # Capture logs
-    local logs
-    logs=$(get_soomkiller_logs_since "60s")
-
-    # Verify the flow
+    # Wait for soomkiller to detect and kill the pod (poll for up to 15 seconds)
     local detected_swap=false
-    local found_pods=false
+    local event_found=false
+    attempts=0
+    local max_attempts=15
+    local logs=""
 
-    if echo "$logs" | grep -q "Swap I/O detected"; then
-        detected_swap=true
-    fi
+    while [[ $attempts -lt $max_attempts ]]; do
+        sleep 1
+        attempts=$((attempts + 1))
 
-    if echo "$logs" | grep -q "pods using swap"; then
-        found_pods=true
-    fi
+        # Check logs for swap detection
+        logs=$(get_soomkiller_logs_since "30s")
+        if echo "$logs" | grep -q "Swap I/O detected"; then
+            detected_swap=true
+        fi
 
-    echo "# Results: detected_swap=$detected_swap found_pods=$found_pods"
+        # Check for Soomkilled event for this specific pod
+        if [[ -n "$pod_name" ]] && kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled 2>/dev/null | grep -q "$pod_name"; then
+            event_found=true
+            echo "# Soomkilled event detected after $attempts seconds"
+            break
+        fi
+    done
+
+    # Show job status (persists even after pod deletion)
+    echo "# Job status:"
+    kubectl get job memory-hog -n "$NAMESPACE" -o wide 2>/dev/null || true
+
+    # Show results
+    echo "# Results: detected_swap=$detected_swap event_found=$event_found"
 
     # Show relevant logs
     echo "# Relevant logs:"
     echo "$logs" | grep -E "(Swap I/O|pods using swap|over threshold|memory-hog)" | tail -10 || true
 
-    # Check for Soomkilled event created after test started
-    local event_found=false
-    local recent_events
-    recent_events=$(kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled \
-        -o jsonpath='{range .items[?(@.lastTimestamp >= "'"$test_start_time"'")]}{.involvedObject.name}{"\n"}{end}' 2>/dev/null || true)
-    if echo "$recent_events" | grep -q memory-hog; then
-        event_found=true
-        echo "# Soomkilled event found (after $test_start_time):"
-        kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled | grep memory-hog | tail -3
+    # Show event if found
+    if $event_found; then
+        echo "# Soomkilled event:"
+        kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled | grep "$pod_name" | tail -3
     fi
 
     # Cleanup
-    kubectl delete pod memory-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+    kubectl delete job memory-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
 
-    # This test may not trigger swap if the node has plenty of free memory
-    # We log the result but don't fail - the core functionality tests (1-3) are more important
+    # Fail if swap was not detected
     if ! $detected_swap; then
-        echo "# NOTE: No swap I/O detected - node may have sufficient free memory"
-        echo "# This is expected in environments with abundant memory"
-        skip "Swap was not triggered - node has sufficient free memory"
+        echo "ERROR: Swap I/O was not detected by soomkiller"
+        echo "# Check vm.swappiness on worker node (must be > 0):"
+        kubectl get nodes -o name | head -1 | xargs -I{} kubectl debug {} -it --image=busybox -- cat /proc/sys/vm/swappiness 2>/dev/null || true
+        false
     fi
 
-    # Verify Soomkilled event was emitted
+    # Fail if Soomkilled event was not emitted
     if ! $event_found; then
-        echo "ERROR: Soomkilled event not found for memory-hog pod"
+        echo "ERROR: Soomkilled event not found for pod $pod_name"
         echo "# Available Soomkilled events:"
         kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled || true
-        false  # Fail the test
+        false
     fi
 }
