@@ -108,7 +108,7 @@ setup() {
     # Create memory-hog job (runs stress command automatically)
     kubectl apply -f "$(get_project_root)/deploy/e2e/memory-hog.yaml"
 
-    # Get the pod name created by the job
+    # Get the pod name (must capture before pod is deleted)
     local pod_name=""
     local attempts=0
     while [[ -z "$pod_name" && $attempts -lt 10 ]]; do
@@ -116,32 +116,51 @@ setup() {
         attempts=$((attempts + 1))
         pod_name=$(kubectl get pods -n "$NAMESPACE" -l job-name=memory-hog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     done
-    echo "# Pod name: $pod_name"
+    echo "# Memory-hog pod: $pod_name"
 
-    # Wait for soomkiller to detect and kill the pod (poll for up to 15 seconds)
-    local detected_swap=false
+    # Wait for Soomkilled event for this specific pod (poll for up to 15 seconds)
     local event_found=false
     attempts=0
     local max_attempts=15
-    local logs=""
 
     while [[ $attempts -lt $max_attempts ]]; do
         sleep 1
         attempts=$((attempts + 1))
 
-        # Check logs for swap detection
-        logs=$(get_soomkiller_logs_since "30s")
-        if echo "$logs" | grep -q "Swap I/O detected"; then
-            detected_swap=true
-        fi
-
         # Check for Soomkilled event for this specific pod
-        if [[ -n "$pod_name" ]] && kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled 2>/dev/null | grep -q "$pod_name"; then
+        if kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled 2>/dev/null | grep -q "$pod_name"; then
             event_found=true
             echo "# Soomkilled event detected after $attempts seconds"
             break
         fi
     done
+
+    # Parse node name from event message (format: "Pod <name> deleted by kube-soomkiller on node <node>: ...")
+    local node=""
+    local event_message=""
+    if $event_found; then
+        event_message=$(kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled -o jsonpath='{.items[?(@.involvedObject.name=="'"$pod_name"'")].message}' 2>/dev/null || true)
+        node=$(echo "$event_message" | grep -oP 'on node \K[^:]+' || true)
+        echo "# Node (from event): $node"
+    fi
+
+    # Get soomkiller logs from the specific node
+    local logs=""
+    if [[ -n "$node" ]]; then
+        local soomkiller_pod
+        soomkiller_pod=$(kubectl get pods -n "$NAMESPACE" -l app=kube-soomkiller \
+            --field-selector spec.nodeName="$node" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [[ -n "$soomkiller_pod" ]]; then
+            echo "# Soomkiller pod on node $node: $soomkiller_pod"
+            logs=$(kubectl logs -n "$NAMESPACE" "$soomkiller_pod" --since=60s 2>/dev/null || true)
+        fi
+    fi
+
+    # Check logs for swap detection
+    local detected_swap=false
+    if echo "$logs" | grep -q "Swap I/O detected"; then
+        detected_swap=true
+    fi
 
     # Show job status (persists even after pod deletion)
     echo "# Job status:"
@@ -151,8 +170,10 @@ setup() {
     echo "# Results: detected_swap=$detected_swap event_found=$event_found"
 
     # Show relevant logs
-    echo "# Relevant logs:"
-    echo "$logs" | grep -E "(Swap I/O|pods using swap|over threshold|memory-hog)" | tail -10 || true
+    if [[ -n "$logs" ]]; then
+        echo "# Relevant logs:"
+        echo "$logs" | grep -E "(Swap I/O|pods using swap|over threshold|memory-hog)" | tail -10 || true
+    fi
 
     # Show event if found
     if $event_found; then

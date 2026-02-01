@@ -413,9 +413,8 @@ func (c *Controller) terminatePod(ctx context.Context, cand PodCandidate) error 
 		pod, err := c.config.K8sClient.CoreV1().Pods(cand.Namespace).Get(ctx, cand.Name, metav1.GetOptions{})
 		if err == nil {
 			c.config.EventRecorder.Eventf(pod, corev1.EventTypeWarning, "Soomkilled",
-				"Pod killed by kube-soomkiller: swap usage %.1f%% exceeded threshold %.1f%% (swap: %.1fMB, limit: %.1fMB)",
-				cand.SwapPercent, c.config.SwapThresholdPercent,
-				float64(cand.SwapBytes)/1024/1024, float64(cand.MemoryMax)/1024/1024)
+				"Pod %s deleted by kube-soomkiller on node %s: swap usage %.1fMiB",
+				cand.Name, c.config.NodeName, float64(cand.SwapBytes)/1024/1024)
 		} else {
 			klog.V(2).Infof("Could not get pod %s/%s for event: %v", cand.Namespace, cand.Name, err)
 		}
