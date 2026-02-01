@@ -151,6 +151,14 @@ setup() {
     echo "# Relevant logs:"
     echo "$logs" | grep -E "(Swap I/O|pods using swap|over threshold|memory-hog)" | tail -10 || true
 
+    # Check for Soomkilled event
+    local event_found=false
+    if kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled 2>/dev/null | grep -q memory-hog; then
+        event_found=true
+        echo "# Soomkilled event found:"
+        kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled | grep memory-hog | tail -3
+    fi
+
     # Cleanup
     kubectl delete pod memory-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
 
@@ -160,5 +168,12 @@ setup() {
         echo "# NOTE: No swap I/O detected - node may have sufficient free memory"
         echo "# This is expected in environments with abundant memory"
         skip "Swap was not triggered - node has sufficient free memory"
+    fi
+
+    # Verify Soomkilled event was emitted
+    if ! $event_found; then
+        echo "# WARNING: Soomkilled event not found for memory-hog pod"
+        echo "# Available events:"
+        kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled || true
     fi
 }
