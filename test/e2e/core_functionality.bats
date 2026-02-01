@@ -1,8 +1,10 @@
 #!/usr/bin/env bats
 # Core functionality tests for kube-soomkiller v2
 
-# Default timeout for each test (in seconds)
-export BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
+setup_file() {
+    # Default timeout for each test (in seconds)
+    export BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
+}
 
 setup() {
     load 'test_helper'
@@ -109,6 +111,10 @@ setup() {
 # Note: This test depends on cluster having limited memory to trigger swap.
 # It may be skipped in environments with abundant memory.
 @test "memory pressure triggers swap detection (requires constrained memory)" {
+    # Capture test start time for filtering events
+    local test_start_time
+    test_start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
     # Delete any existing memory-hog pod
     kubectl delete pod memory-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
     sleep 2
@@ -151,11 +157,14 @@ setup() {
     echo "# Relevant logs:"
     echo "$logs" | grep -E "(Swap I/O|pods using swap|over threshold|memory-hog)" | tail -10 || true
 
-    # Check for Soomkilled event
+    # Check for Soomkilled event created after test started
     local event_found=false
-    if kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled 2>/dev/null | grep -q memory-hog; then
+    local recent_events
+    recent_events=$(kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled \
+        -o jsonpath='{range .items[?(@.lastTimestamp >= "'"$test_start_time"'")]}{.involvedObject.name}{"\n"}{end}' 2>/dev/null || true)
+    if echo "$recent_events" | grep -q memory-hog; then
         event_found=true
-        echo "# Soomkilled event found:"
+        echo "# Soomkilled event found (after $test_start_time):"
         kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled | grep memory-hog | tail -3
     fi
 
@@ -172,8 +181,9 @@ setup() {
 
     # Verify Soomkilled event was emitted
     if ! $event_found; then
-        echo "# WARNING: Soomkilled event not found for memory-hog pod"
-        echo "# Available events:"
+        echo "ERROR: Soomkilled event not found for memory-hog pod"
+        echo "# Available Soomkilled events:"
         kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled || true
+        false  # Fail the test
     fi
 }
