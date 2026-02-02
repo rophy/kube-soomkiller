@@ -70,7 +70,7 @@ func (p *PodInformer) WaitForCacheSync(stopCh <-chan struct{}) bool {
 func (p *PodInformer) GetPodByUID(uid string) *corev1.Pod {
 	objs, err := p.indexer.ByIndex(uidIndex, uid)
 	if err != nil {
-		klog.Warningf("Error looking up pod by UID %s: %v", uid, err)
+		klog.InfoS("Failed to look up pod by UID", "uid", uid, "err", err)
 		return nil
 	}
 	if len(objs) == 0 {

@@ -18,15 +18,20 @@ The new design is based on a key insight: **any swap usage means the pod exceede
 
 ```
 Every poll-interval (1s):
-  1. Read /proc/vmstat (pswpout + pswpin)
-  2. If swap I/O rate > 0:
-     a. Scan pod cgroups on this node
-     b. For each pod:
-        - Read memory.swap.current
-        - Read memory.max
-        - Calculate: swap_ratio = swap.current / memory.max
-     c. Kill all pods where swap_ratio > swap-threshold-percent
+  1. Scan pod cgroups on this node
+  2. For each burstable pod:
+     - Read memory.swap.current
+     - Read memory.max
+     - Calculate: swap_ratio = swap.current / memory.max
+  3. Kill all pods where swap_ratio > swap-threshold-percent
 ```
+
+**Note:** Earlier designs considered using `/proc/vmstat` swap I/O rate as a trigger
+(only scan when swap I/O > 0). This was removed because:
+- Swap usage (`memory.swap.current > 0`) is the actual signal we care about
+- Checking swap I/O rate adds complexity without benefit
+- Pods can have swap allocated without active I/O (pages already swapped)
+- The cgroup scan is lightweight (filesystem reads only, no API calls)
 
 ## Parameters
 
@@ -34,7 +39,7 @@ Every poll-interval (1s):
 
 | Parameter | Reason |
 |-----------|--------|
-| `--swap-io-threshold` | Now triggers on any I/O > 0 |
+| `--swap-io-threshold` | Per-pod swap usage is the trigger, not node-level I/O rate |
 | `--sustained-duration` | No longer waiting for sustained pressure |
 | `--cooldown-period` | Each pod evaluated independently |
 
@@ -94,11 +99,9 @@ type Config struct {
 type Controller struct {
     config Config
 
-    // State tracking
-    lastSwapIO     *metrics.SwapIOStats
-    lastSampleTime time.Time
-
+    // No state tracking needed - each scan is independent
     // Remove:
+    // - lastSwapIO, lastSampleTime (no swap I/O rate tracking)
     // - thresholdExceeded time.Time
     // - lastKillTime time.Time
     // - lastRateAbove bool
@@ -125,39 +128,9 @@ type PodCandidate struct {
 
 ```go
 func (c *Controller) reconcile(ctx context.Context) error {
-    now := time.Now()
-
-    // Get current swap I/O stats
-    swapIO, err := c.config.Metrics.GetSwapIOStats()
-    if err != nil {
-        return fmt.Errorf("failed to get swap I/O stats: %w", err)
-    }
-
-    // Calculate swap I/O rate
-    var swapIORate float64
-    if c.lastSwapIO != nil {
-        elapsed := now.Sub(c.lastSampleTime).Seconds()
-        if elapsed > 0 {
-            pswpInDelta := swapIO.PswpIn - c.lastSwapIO.PswpIn
-            pswpOutDelta := swapIO.PswpOut - c.lastSwapIO.PswpOut
-            swapIORate = float64(pswpInDelta+pswpOutDelta) / elapsed
-        }
-    }
-    c.lastSwapIO = swapIO
-    c.lastSampleTime = now
-
-    // Update metrics
-    metrics.SwapIORate.Set(swapIORate)
-
-    // No swap activity = nothing to do
-    if swapIORate == 0 {
-        klog.V(2).Info("No swap I/O activity")
-        return nil
-    }
-
-    klog.V(1).Infof("Swap I/O detected: %.1f pages/sec, scanning pods", swapIORate)
-
-    // Find and kill pods over threshold
+    // Scan cgroups and kill pods over threshold
+    // No swap I/O rate check - we scan every interval
+    // (cgroup scan is lightweight: filesystem reads only, no API calls)
     return c.findAndKillOverThreshold(ctx)
 }
 ```

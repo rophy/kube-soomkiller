@@ -48,7 +48,7 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 | `--metrics-addr` | :8080 | Address to serve Prometheus metrics |
 | `--protected-namespaces` | kube-system | Comma-separated list of namespaces to never kill pods from |
 
-**How it works:** When any swap I/O is detected, the controller scans all pods on the node. Pods with `memory.swap.current / memory.max > swap-threshold-percent` are terminated. The threshold is expressed as a percentage of the pod's memory limit.
+**How it works:** Every poll interval, the controller scans all pod cgroups on the node. Pods with `memory.swap.current / memory.max > swap-threshold-percent` are terminated. The threshold is expressed as a percentage of the pod's memory limit.
 
 ### Prometheus Metrics
 
@@ -56,7 +56,8 @@ The controller exposes metrics on `:8080/metrics`:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `soomkiller_swap_io_rate_pages_per_second` | Gauge | Current swap I/O rate |
+| `soomkiller_node_swap_in_pages_total` | Counter | Total pages swapped in (from /proc/vmstat) |
+| `soomkiller_node_swap_out_pages_total` | Counter | Total pages swapped out (from /proc/vmstat) |
 | `soomkiller_pods_killed_total` | Counter | Total pods killed |
 | `soomkiller_last_kill_timestamp_seconds` | Gauge | Unix timestamp of last pod kill |
 | `soomkiller_candidate_pods_count` | Gauge | Pods currently using swap |
@@ -225,7 +226,7 @@ kubectl logs -n kube-soomkiller daemonset/kube-soomkiller -f
 
 The script handles MariaDB restart, table preparation, sysbench execution, and Prometheus metrics collection. Output includes TPS, latency, memory/swap usage, and swap I/O time series.
 
-When swap I/O exceeds 1000 pages/sec for 10 seconds, soomkiller will terminate the MariaDB pod gracefully.
+When MariaDB's swap usage exceeds the threshold (default 1% of memory limit), soomkiller will terminate the pod gracefully.
 
 **Running automated e2e tests:**
 
@@ -256,22 +257,19 @@ When a pod exceeds its memory limit, the Linux kernel's OOM killer sends SIGKILL
 
 ## Solution Overview
 
-Monitor node-level swap I/O and proactively terminate pods under memory pressure before the system becomes unresponsive. Swap provides a natural "buffer" - pods under pressure are stalled on swap I/O, giving the controller time to detect and act.
+Proactively terminate pods under memory pressure before the system becomes unresponsive. Swap provides a natural "buffer" - pods under pressure are stalled on swap I/O, giving the controller time to detect and act.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                       Architecture                          │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│   /proc/vmstat (node-level)                                 │
-│   ├── pswpin:  pages swapped in                             │
-│   └── pswpout: pages swapped out                            │
+│   Every poll-interval (1s default)                          │
 │          │                                                  │
-│          │ swap_io_rate > 0 (any swap activity)             │
 │          ▼                                                  │
 │   ┌─────────────────┐      ┌─────────────────────────────┐  │
 │   │   Controller    │      │  Per-pod metrics (cgroup)   │  │
-│   │   (DaemonSet)   │◀────▶│  - memory.swap.current      │  │
+│   │   (DaemonSet)   │─────▶│  - memory.swap.current      │  │
 │   └────────┬────────┘      │  - memory.max               │  │
 │            │               └─────────────────────────────┘  │
 │            │                                                │
@@ -288,28 +286,23 @@ Monitor node-level swap I/O and proactively terminate pods under memory pressure
 
 ## How It Works
 
-### 1. Node-Level Swap I/O Monitoring
+### 1. Periodic Cgroup Scanning
 
-The controller monitors `/proc/vmstat` for swap activity. This file shows system-wide kernel statistics and is not namespaced, so it can be read from within a container without special volume mounts:
+Every poll interval (default 1s), the controller scans all pod cgroups on the node. This is a lightweight filesystem operation with no Kubernetes API calls. The scan reads:
 
-```bash
-$ cat /proc/vmstat | grep -E '^psw'
-pswpin 12345    # cumulative pages swapped in
-pswpout 67890   # cumulative pages swapped out
+- `memory.swap.current` - current swap usage in bytes
+- `memory.max` - memory limit in bytes
+
+Only burstable pods are scanned, since guaranteed pods don't use swap and besteffort pods have no memory limits.
+
+### 2. Threshold Check
+
+For each pod, the controller calculates:
+```
+swap_percent = memory.swap.current / memory.max * 100
 ```
 
-By sampling periodically, it calculates the swap I/O rate:
-```
-swap_io_rate = (pswpin_delta + pswpout_delta) / interval
-```
-
-### 2. Trigger Condition
-
-```
-swap_io_rate > 0
-```
-
-Any swap activity indicates memory pressure. The controller then scans all pods to find those exceeding the threshold.
+Pods with `swap_percent > swap-threshold-percent` are candidates for termination.
 
 ### 3. Pod Selection and Termination
 
@@ -446,11 +439,9 @@ Start with the default (1%) and adjust based on your workload characteristics. L
 
 ### Per-Pod Swap I/O Attribution
 
-cgroup v2 does not expose per-cgroup `pswpin`/`pswpout` counters. We use:
-- Node-level swap I/O as trigger (any swap activity)
-- Per-pod `memory.swap.current` / `memory.max` for threshold-based kill
+cgroup v2 does not expose per-cgroup `pswpin`/`pswpout` counters. We use per-pod `memory.swap.current` / `memory.max` for threshold-based termination.
 
-This means we detect node-level swap activity, then check each pod's swap usage as a percentage of its memory limit.
+This means we detect swap usage (bytes allocated), not swap I/O rate (pages/sec). A pod with allocated swap that isn't actively thrashing will still be terminated if above threshold.
 
 ### Single Point of Failure
 
@@ -474,7 +465,7 @@ The controller DaemonSet must be running. If it fails:
 1. **eBPF-based swap I/O tracking** - Per-pod swap I/O attribution
 2. **PodDisruptionBudget awareness** - Optionally respect PDB
 3. **Predictive termination** - Use swap growth rate to predict pressure
-4. **Structured logging** - JSON output with consistent log levels for better observability
+4. **Helm chart** - For easier deployment and configuration
 
 ## References
 
