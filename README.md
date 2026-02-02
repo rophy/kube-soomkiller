@@ -474,6 +474,7 @@ The controller DaemonSet must be running. If it fails:
 1. **eBPF-based swap I/O tracking** - Per-pod swap I/O attribution
 2. **PodDisruptionBudget awareness** - Optionally respect PDB
 3. **Predictive termination** - Use swap growth rate to predict pressure
+4. **Structured logging** - JSON output with consistent log levels for better observability
 
 ## References
 

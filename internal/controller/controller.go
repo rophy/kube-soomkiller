@@ -282,20 +282,20 @@ func (c *Controller) scanCgroupsForSwap() ([]PodCandidate, error) {
 		// Filter by QoS: only Burstable pods get swap in LimitedSwap mode
 		qos := extractQoSFromCgroup(cgroupPath)
 		if qos != "burstable" {
-			klog.V(3).Infof("Skipping cgroup %s: QoS is %s (not burstable)", cgroupPath, qos)
+			klog.V(4).Infof("Skipping cgroup %s: QoS is %s (not burstable)", cgroupPath, qos)
 			continue
 		}
 
 		// Extract pod UID from cgroup path
 		uid := extractPodUIDFromCgroup(cgroupPath)
 		if uid == "" {
-			klog.V(3).Infof("Could not extract pod UID from cgroup %s", cgroupPath)
+			klog.Warningf("Could not extract pod UID from cgroup %s", cgroupPath)
 			continue
 		}
 
 		containerMetrics, err := c.config.Metrics.GetContainerMetrics(cgroupPath)
 		if err != nil {
-			klog.V(3).Infof("Failed to get metrics for %s: %v", cgroupPath, err)
+			klog.Warningf("Failed to get metrics for %s: %v", cgroupPath, err)
 			continue
 		}
 
