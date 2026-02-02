@@ -202,14 +202,14 @@ func (s *Scanner) GetSwapIOStats() (*SwapIOStats, error) {
 		case "pswpin":
 			val, err := strconv.ParseUint(fields[1], 10, 64)
 			if err != nil {
-				klog.InfoS("Failed to parse pswpin value", "value", fields[1], "err", err)
+				klog.V(4).InfoS("Failed to parse pswpin value", "value", fields[1], "err", err)
 			} else {
 				stats.PswpIn = val
 			}
 		case "pswpout":
 			val, err := strconv.ParseUint(fields[1], 10, 64)
 			if err != nil {
-				klog.InfoS("Failed to parse pswpout value", "value", fields[1], "err", err)
+				klog.V(4).InfoS("Failed to parse pswpout value", "value", fields[1], "err", err)
 			} else {
 				stats.PswpOut = val
 			}

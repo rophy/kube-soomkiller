@@ -57,7 +57,7 @@ func uidIndexFunc(obj interface{}) ([]string, error) {
 
 // Run starts the informer. Call this in a goroutine.
 func (p *PodInformer) Run(stopCh <-chan struct{}) {
-	klog.Info("Starting pod informer")
+	klog.InfoS("Starting pod informer")
 	p.informer.Run(stopCh)
 }
 

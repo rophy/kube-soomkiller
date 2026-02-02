@@ -4,11 +4,7 @@ This document outlines the logging strategy for kube-soomkiller, aligned with [K
 
 ## Current State
 
-The codebase uses unstructured klog functions (`klog.Infof`, `klog.Warningf`, `klog.Errorf`).
-
-## Target State
-
-Migrate to structured logging with `klog.InfoS` and `klog.ErrorS` for better observability and JSON output support.
+The codebase uses structured logging with `klog.InfoS`, `klog.ErrorS`, and `klog.Warning` following Kubernetes conventions. JSON output is supported via `--logging-format=json`.
 
 ## Verbosity Levels
 
@@ -94,26 +90,18 @@ I0202 12:34:56.789012   12345 controller.go:100] "Deleted pod" pod="default/my-p
 {"ts":1706875696.789,"v":0,"msg":"Deleted pod","pod":{"namespace":"default","name":"my-pod"},"reason":"swap threshold exceeded"}
 ```
 
-## Migration Plan
+## Migration Status
 
-### Phase 1: Adjust verbosity levels (current)
-- [x] V(4) for per-cgroup scan info
-- [x] V(4) for per-scan status (swap I/O detected, no pods using swap)
+All phases complete:
+
+- [x] V(4) for per-cgroup scan info and debug details
 - [x] V(3) for filtering decisions
 - [x] V(2) for steady state changes (pods over threshold)
-- [x] Warning for abnormalities
-
-### Phase 2: Migrate to structured logging
-- [x] Replace `klog.Infof` with `klog.InfoS`
-- [x] Replace `klog.Errorf` with `klog.ErrorS`
-- [x] Replace `klog.Warningf` with `klog.InfoS` at appropriate level or keep as warning
-- [x] Use `klog.KRef()` and `klog.KObj()` for Kubernetes objects
-
-### Phase 3: Message style cleanup
-- [x] Fix message capitalization
-- [x] Change to past tense
-- [x] Remove ending punctuation
-- [x] Ensure object types are specified
+- [x] Warning for abnormalities (could not extract UID, failed to get metrics)
+- [x] ErrorS for actionable errors (failed to delete pod, failed to find cgroups)
+- [x] Structured logging with `klog.InfoS`, `klog.ErrorS`, `klog.Warning`
+- [x] Use `klog.KRef()` for namespace/name pairs
+- [x] Message style: capitalized, past tense, no punctuation
 
 ## Error Handling
 

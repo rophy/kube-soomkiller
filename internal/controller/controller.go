@@ -203,7 +203,7 @@ func (c *Controller) scanCgroupsForSwap() ([]PodCandidate, error) {
 	// Find all container cgroups via filesystem walk
 	cgroupsResult, err := c.config.CgroupScanner.FindPodCgroups()
 	if err != nil {
-		klog.InfoS("Failed to find pod cgroups", "err", err)
+		klog.ErrorS(err, "Failed to find pod cgroups")
 		return nil, nil
 	}
 
@@ -221,13 +221,13 @@ func (c *Controller) scanCgroupsForSwap() ([]PodCandidate, error) {
 		// Extract pod UID from cgroup path
 		uid := cgroup.ExtractPodUID(cgroupPath)
 		if uid == "" {
-			klog.InfoS("Could not extract pod UID from cgroup", "cgroupPath", cgroupPath)
+			klog.Warning("Could not extract pod UID from cgroup", "cgroupPath", cgroupPath)
 			continue
 		}
 
 		containerMetrics, err := c.config.CgroupScanner.GetContainerMetrics(cgroupPath)
 		if err != nil {
-			klog.InfoS("Failed to get metrics for cgroup", "cgroupPath", cgroupPath, "err", err)
+			klog.Warning("Failed to get metrics for cgroup", "cgroupPath", cgroupPath, "err", err)
 			continue
 		}
 
