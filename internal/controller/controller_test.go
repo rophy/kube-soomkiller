@@ -24,6 +24,7 @@ func createFakeCgroup(t *testing.T, cgroupRoot, cgroupPath string, swapBytes, me
 
 	files := map[string]string{
 		"memory.swap.current": fmt.Sprintf("%d", swapBytes),
+		"memory.swap.max":     "max", // unlimited swap
 		"memory.current":      "268435456",
 		"memory.max":          fmt.Sprintf("%d", memoryMax),
 		"memory.pressure": `some avg10=1.00 avg60=1.00 avg300=1.00 total=1000

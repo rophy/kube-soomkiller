@@ -121,8 +121,9 @@ type PSI struct {
 // ContainerMetrics contains memory-related metrics for a container
 type ContainerMetrics struct {
 	CgroupPath    string
-	SwapCurrent   int64 // bytes
-	MemoryCurrent int64 // bytes
+	SwapCurrent   int64 // bytes (memory.swap.current)
+	SwapMax       int64 // bytes (memory.swap.max limit)
+	MemoryCurrent int64 // bytes (memory.current)
 	MemoryMax     int64 // bytes (memory.max limit)
 	PSI           PSI
 }
@@ -141,6 +142,13 @@ func (s *Scanner) GetContainerMetrics(cgroupPath string) (*ContainerMetrics, err
 		return nil, fmt.Errorf("failed to read memory.swap.current: %w", err)
 	}
 	metrics.SwapCurrent = swapCurrent
+
+	// Read memory.swap.max (uses same format as memory.max: number or "max")
+	swapMax, err := readMemoryMax(filepath.Join(fullPath, "memory.swap.max"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read memory.swap.max: %w", err)
+	}
+	metrics.SwapMax = swapMax
 
 	// Read memory.current
 	memoryCurrent, err := readInt64File(filepath.Join(fullPath, "memory.current"))

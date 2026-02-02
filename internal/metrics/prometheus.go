@@ -12,67 +12,86 @@ const (
 	namespace = "soomkiller"
 )
 
-var (
+// Metrics holds all the prometheus metrics with node label
+type Metrics struct {
+	nodeName string
+
 	// Pod termination metrics
-	PodsKilledTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Name:      "pods_killed_total",
-		Help:      "Total number of pods killed due to swap pressure",
-	})
+	PodsKilledTotal   prometheus.Counter
+	LastKillTimestamp prometheus.Gauge
 
-	LastKillTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "last_kill_timestamp_seconds",
-		Help:      "Unix timestamp of the last pod kill",
-	})
+	// Configuration metrics
+	ConfigSwapThresholdPercent prometheus.Gauge
+	ConfigDryRun               prometheus.Gauge
+}
 
-	// Configuration metrics (for visibility)
-	ConfigSwapThresholdPercent = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "config_swap_threshold_percent",
-		Help:      "Configured swap threshold as percentage of memory limit",
-	})
+// NewMetrics creates metrics with the node label
+func NewMetrics(nodeName string) *Metrics {
+	nodeLabel := prometheus.Labels{"node": nodeName}
 
-	ConfigDryRun = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "config_dry_run",
-		Help:      "1 if dry-run mode is enabled, 0 otherwise",
-	})
-)
+	return &Metrics{
+		nodeName: nodeName,
+		PodsKilledTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "pods_killed_total",
+			Help:        "Total number of pods killed due to swap pressure",
+			ConstLabels: nodeLabel,
+		}),
+		LastKillTimestamp: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "last_kill_timestamp_seconds",
+			Help:        "Unix timestamp of the last pod kill",
+			ConstLabels: nodeLabel,
+		}),
+		ConfigSwapThresholdPercent: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "config_swap_threshold_percent",
+			Help:        "Configured swap threshold as percentage of memory limit",
+			ConstLabels: nodeLabel,
+		}),
+		ConfigDryRun: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "config_dry_run",
+			Help:        "1 if dry-run mode is enabled, 0 otherwise",
+			ConstLabels: nodeLabel,
+		}),
+	}
+}
 
-// RegisterMetrics registers all Prometheus metrics
-func RegisterMetrics() {
+// Register registers all metrics with prometheus
+func (m *Metrics) Register() {
 	prometheus.MustRegister(
-		// Pod termination
-		PodsKilledTotal,
-		LastKillTimestamp,
-
-		// Config
-		ConfigSwapThresholdPercent,
-		ConfigDryRun,
+		m.PodsKilledTotal,
+		m.LastKillTimestamp,
+		m.ConfigSwapThresholdPercent,
+		m.ConfigDryRun,
 	)
 }
 
 // SwapIOCollector exposes node-level swap I/O counters from /proc/vmstat
 type SwapIOCollector struct {
 	scanner     *cgroup.Scanner
+	nodeName    string
 	pswpInDesc  *prometheus.Desc
 	pswpOutDesc *prometheus.Desc
 }
 
 // NewSwapIOCollector creates a collector that exposes swap I/O counters
-func NewSwapIOCollector(scanner *cgroup.Scanner) *SwapIOCollector {
+func NewSwapIOCollector(scanner *cgroup.Scanner, nodeName string) *SwapIOCollector {
+	nodeLabel := prometheus.Labels{"node": nodeName}
+
 	return &SwapIOCollector{
-		scanner: scanner,
+		scanner:  scanner,
+		nodeName: nodeName,
 		pswpInDesc: prometheus.NewDesc(
 			namespace+"_node_swap_in_pages_total",
 			"Total pages swapped in (from /proc/vmstat pswpin)",
-			nil, nil,
+			nil, nodeLabel,
 		),
 		pswpOutDesc: prometheus.NewDesc(
 			namespace+"_node_swap_out_pages_total",
 			"Total pages swapped out (from /proc/vmstat pswpout)",
-			nil, nil,
+			nil, nodeLabel,
 		),
 	}
 }
@@ -95,8 +114,8 @@ func (c *SwapIOCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 // RegisterSwapIOCollector registers the swap I/O collector
-func RegisterSwapIOCollector(scanner *cgroup.Scanner) {
-	prometheus.MustRegister(NewSwapIOCollector(scanner))
+func RegisterSwapIOCollector(scanner *cgroup.Scanner, nodeName string) {
+	prometheus.MustRegister(NewSwapIOCollector(scanner, nodeName))
 }
 
 // PodLookup is an interface for looking up pods by UID
@@ -108,39 +127,42 @@ type PodLookup interface {
 type ContainerMetricsCollector struct {
 	scanner   *cgroup.Scanner
 	podLookup PodLookup
+	nodeName  string
 
-	swapBytesDesc      *prometheus.Desc
-	memoryMaxDesc      *prometheus.Desc
-	psiSomeAvg10Desc   *prometheus.Desc
-	psiFullAvg10Desc   *prometheus.Desc
+	swapBytesDesc     *prometheus.Desc
+	swapMaxDesc       *prometheus.Desc
+	memoryCurrentDesc *prometheus.Desc
+	memoryMaxDesc     *prometheus.Desc
 }
 
 // NewContainerMetricsCollector creates a collector for per-container metrics
-func NewContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup) *ContainerMetricsCollector {
+func NewContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup, nodeName string) *ContainerMetricsCollector {
 	labels := []string{"namespace", "pod", "container"}
+	nodeLabel := prometheus.Labels{"node": nodeName}
 
 	return &ContainerMetricsCollector{
 		scanner:   scanner,
 		podLookup: podLookup,
+		nodeName:  nodeName,
 		swapBytesDesc: prometheus.NewDesc(
 			namespace+"_container_swap_bytes",
 			"Current swap usage in bytes per container",
-			labels, nil,
+			labels, nodeLabel,
+		),
+		swapMaxDesc: prometheus.NewDesc(
+			namespace+"_container_swap_max_bytes",
+			"Swap limit in bytes per container",
+			labels, nodeLabel,
+		),
+		memoryCurrentDesc: prometheus.NewDesc(
+			namespace+"_container_memory_current_bytes",
+			"Current memory usage in bytes per container",
+			labels, nodeLabel,
 		),
 		memoryMaxDesc: prometheus.NewDesc(
 			namespace+"_container_memory_max_bytes",
 			"Memory limit in bytes per container",
-			labels, nil,
-		),
-		psiSomeAvg10Desc: prometheus.NewDesc(
-			namespace+"_container_memory_psi_some_avg10",
-			"Percentage of time at least one task was stalled on memory (10s average)",
-			labels, nil,
-		),
-		psiFullAvg10Desc: prometheus.NewDesc(
-			namespace+"_container_memory_psi_full_avg10",
-			"Percentage of time all tasks were stalled on memory (10s average)",
-			labels, nil,
+			labels, nodeLabel,
 		),
 	}
 }
@@ -148,9 +170,9 @@ func NewContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup) 
 // Describe implements prometheus.Collector
 func (c *ContainerMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.swapBytesDesc
+	ch <- c.swapMaxDesc
+	ch <- c.memoryCurrentDesc
 	ch <- c.memoryMaxDesc
-	ch <- c.psiSomeAvg10Desc
-	ch <- c.psiFullAvg10Desc
 }
 
 // Collect implements prometheus.Collector - scans cgroups on each scrape
@@ -196,12 +218,12 @@ func (c *ContainerMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 
 		ch <- prometheus.MustNewConstMetric(c.swapBytesDesc, prometheus.GaugeValue,
 			float64(metrics.SwapCurrent), labels...)
+		ch <- prometheus.MustNewConstMetric(c.swapMaxDesc, prometheus.GaugeValue,
+			float64(metrics.SwapMax), labels...)
+		ch <- prometheus.MustNewConstMetric(c.memoryCurrentDesc, prometheus.GaugeValue,
+			float64(metrics.MemoryCurrent), labels...)
 		ch <- prometheus.MustNewConstMetric(c.memoryMaxDesc, prometheus.GaugeValue,
 			float64(metrics.MemoryMax), labels...)
-		ch <- prometheus.MustNewConstMetric(c.psiSomeAvg10Desc, prometheus.GaugeValue,
-			metrics.PSI.SomeAvg10, labels...)
-		ch <- prometheus.MustNewConstMetric(c.psiFullAvg10Desc, prometheus.GaugeValue,
-			metrics.PSI.FullAvg10, labels...)
 	}
 }
 
@@ -238,6 +260,6 @@ func matchContainerID(statusID, cgroupID string) bool {
 }
 
 // RegisterContainerMetricsCollector registers the per-container metrics collector
-func RegisterContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup) {
-	prometheus.MustRegister(NewContainerMetricsCollector(scanner, podLookup))
+func RegisterContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup, nodeName string) {
+	prometheus.MustRegister(NewContainerMetricsCollector(scanner, podLookup, nodeName))
 }

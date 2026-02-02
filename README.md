@@ -56,16 +56,16 @@ The controller exposes metrics on `:8080/metrics`:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `soomkiller_node_swap_in_pages_total` | Counter | - | Total pages swapped in (from /proc/vmstat) |
-| `soomkiller_node_swap_out_pages_total` | Counter | - | Total pages swapped out (from /proc/vmstat) |
-| `soomkiller_pods_killed_total` | Counter | - | Total pods killed |
-| `soomkiller_last_kill_timestamp_seconds` | Gauge | - | Unix timestamp of last pod kill |
-| `soomkiller_container_swap_bytes` | Gauge | namespace, pod, container | Swap usage in bytes |
-| `soomkiller_container_memory_max_bytes` | Gauge | namespace, pod, container | Memory limit in bytes |
-| `soomkiller_container_memory_psi_some_avg10` | Gauge | namespace, pod, container | % time some tasks stalled on memory |
-| `soomkiller_container_memory_psi_full_avg10` | Gauge | namespace, pod, container | % time all tasks stalled on memory |
-| `soomkiller_config_swap_threshold_percent` | Gauge | - | Configured swap threshold % |
-| `soomkiller_config_dry_run` | Gauge | - | 1 if dry-run mode, 0 otherwise |
+| `soomkiller_node_swap_in_pages_total` | Counter | node | Total pages swapped in (from /proc/vmstat) |
+| `soomkiller_node_swap_out_pages_total` | Counter | node | Total pages swapped out (from /proc/vmstat) |
+| `soomkiller_pods_killed_total` | Counter | node | Total pods killed |
+| `soomkiller_last_kill_timestamp_seconds` | Gauge | node | Unix timestamp of last pod kill |
+| `soomkiller_container_swap_bytes` | Gauge | node, namespace, pod, container | Swap usage in bytes |
+| `soomkiller_container_swap_max_bytes` | Gauge | node, namespace, pod, container | Swap limit in bytes |
+| `soomkiller_container_memory_current_bytes` | Gauge | node, namespace, pod, container | Memory usage in bytes |
+| `soomkiller_container_memory_max_bytes` | Gauge | node, namespace, pod, container | Memory limit in bytes |
+| `soomkiller_config_swap_threshold_percent` | Gauge | node | Configured swap threshold % |
+| `soomkiller_config_dry_run` | Gauge | node | 1 if dry-run mode, 0 otherwise |
 
 **Note:** Container metrics are only emitted for burstable pods on the node. You can calculate swap percentage in PromQL:
 ```promql

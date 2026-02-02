@@ -18,9 +18,10 @@ func TestGetContainerMetrics(t *testing.T) {
 
 	// Write metric files
 	files := map[string]string{
-		"memory.swap.current": "104857600", // 100MB
-		"memory.current":      "268435456", // 256MB
-		"memory.max":          "536870912", // 512MB
+		"memory.swap.current": "104857600",  // 100MB
+		"memory.swap.max":     "1073741824", // 1GB
+		"memory.current":      "268435456",  // 256MB
+		"memory.max":          "536870912",  // 512MB
 		"memory.pressure": `some avg10=5.50 avg60=2.30 avg300=1.10 total=123456
 full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 	}
@@ -40,6 +41,9 @@ full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 	// Verify swap
 	if metrics.SwapCurrent != 104857600 {
 		t.Errorf("SwapCurrent = %d, want 104857600", metrics.SwapCurrent)
+	}
+	if metrics.SwapMax != 1073741824 {
+		t.Errorf("SwapMax = %d, want 1073741824", metrics.SwapMax)
 	}
 
 	// Verify memory
@@ -75,6 +79,7 @@ func TestGetContainerMetrics_ZeroSwap(t *testing.T) {
 
 	files := map[string]string{
 		"memory.swap.current": "0",
+		"memory.swap.max":     "536870912", // 512MB
 		"memory.current":      "134217728",
 		"memory.max":          "268435456", // 256MB
 		"memory.pressure": `some avg10=0.00 avg60=0.00 avg300=0.00 total=0
@@ -109,6 +114,7 @@ func TestGetContainerMetrics_UnlimitedMemory(t *testing.T) {
 
 	files := map[string]string{
 		"memory.swap.current": "0",
+		"memory.swap.max":     "max", // unlimited
 		"memory.current":      "134217728",
 		"memory.max":          "max", // unlimited
 		"memory.pressure": `some avg10=0.00 avg60=0.00 avg300=0.00 total=0
@@ -127,10 +133,13 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 		t.Fatalf("GetContainerMetrics() error = %v", err)
 	}
 
-	// memory.max = "max" should return 1<<62 (~4 exabytes)
+	// memory.max = "max" and memory.swap.max = "max" should return 1<<62 (~4 exabytes)
 	expected := int64(1 << 62)
 	if metrics.MemoryMax != expected {
 		t.Errorf("MemoryMax = %d, want %d (1<<62)", metrics.MemoryMax, expected)
+	}
+	if metrics.SwapMax != expected {
+		t.Errorf("SwapMax = %d, want %d (1<<62)", metrics.SwapMax, expected)
 	}
 }
 

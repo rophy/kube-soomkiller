@@ -83,16 +83,17 @@ func main() {
 	}
 	klog.InfoS("Environment validated", "cgroupVersion", "v2", "cgroupDriver", "systemd", "swapEnabled", true)
 
-	// Register Prometheus metrics
-	metrics.RegisterMetrics()
-	metrics.RegisterSwapIOCollector(cgroupScanner)
+	// Register Prometheus metrics (with node label)
+	m := metrics.NewMetrics(nodeName)
+	m.Register()
+	metrics.RegisterSwapIOCollector(cgroupScanner, nodeName)
 
 	// Set config metrics
-	metrics.ConfigSwapThresholdPercent.Set(swapThresholdPercent)
+	m.ConfigSwapThresholdPercent.Set(swapThresholdPercent)
 	if dryRun {
-		metrics.ConfigDryRun.Set(1)
+		m.ConfigDryRun.Set(1)
 	} else {
-		metrics.ConfigDryRun.Set(0)
+		m.ConfigDryRun.Set(0)
 	}
 
 	// Start metrics server
@@ -138,7 +139,7 @@ func main() {
 	podInformer := controller.NewPodInformer(k8sClient, nodeName, 30*time.Second)
 
 	// Register per-container metrics collector (uses informer for pod lookup)
-	metrics.RegisterContainerMetricsCollector(cgroupScanner, podInformer)
+	metrics.RegisterContainerMetricsCollector(cgroupScanner, podInformer, nodeName)
 
 	// Create controller
 	ctrl := controller.New(controller.Config{
