@@ -1,4 +1,4 @@
-package metrics
+package cgroup
 
 import (
 	"os"
@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestGetPodMetrics(t *testing.T) {
+func TestGetContainerMetrics(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create cgroup directory with metric files
@@ -31,10 +31,10 @@ full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 		}
 	}
 
-	collector := NewCollector(tmpDir)
-	metrics, err := collector.GetPodMetrics(cgroupPath)
+	scanner := NewScanner(tmpDir)
+	metrics, err := scanner.GetContainerMetrics(cgroupPath)
 	if err != nil {
-		t.Fatalf("GetPodMetrics() error = %v", err)
+		t.Fatalf("GetContainerMetrics() error = %v", err)
 	}
 
 	// Verify swap
@@ -64,7 +64,7 @@ full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 	}
 }
 
-func TestGetPodMetrics_ZeroSwap(t *testing.T) {
+func TestGetContainerMetrics_ZeroSwap(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cgroupPath := "kubepods.slice/cri-containerd-abc123.scope"
@@ -87,10 +87,10 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 		}
 	}
 
-	collector := NewCollector(tmpDir)
-	metrics, err := collector.GetPodMetrics(cgroupPath)
+	scanner := NewScanner(tmpDir)
+	metrics, err := scanner.GetContainerMetrics(cgroupPath)
 	if err != nil {
-		t.Fatalf("GetPodMetrics() error = %v", err)
+		t.Fatalf("GetContainerMetrics() error = %v", err)
 	}
 
 	if metrics.SwapCurrent != 0 {
@@ -98,7 +98,7 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 	}
 }
 
-func TestGetPodMetrics_UnlimitedMemory(t *testing.T) {
+func TestGetContainerMetrics_UnlimitedMemory(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cgroupPath := "kubepods.slice/cri-containerd-abc123.scope"
@@ -121,10 +121,10 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 		}
 	}
 
-	collector := NewCollector(tmpDir)
-	metrics, err := collector.GetPodMetrics(cgroupPath)
+	scanner := NewScanner(tmpDir)
+	metrics, err := scanner.GetContainerMetrics(cgroupPath)
 	if err != nil {
-		t.Fatalf("GetPodMetrics() error = %v", err)
+		t.Fatalf("GetContainerMetrics() error = %v", err)
 	}
 
 	// memory.max = "max" should return 1<<62 (~4 exabytes)
@@ -134,7 +134,7 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 	}
 }
 
-func TestGetPodMetrics_MissingFiles(t *testing.T) {
+func TestGetContainerMetrics_MissingFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cgroupPath := "kubepods.slice/cri-containerd-abc123.scope"
@@ -145,10 +145,10 @@ func TestGetPodMetrics_MissingFiles(t *testing.T) {
 
 	// Don't create any metric files
 
-	collector := NewCollector(tmpDir)
-	_, err := collector.GetPodMetrics(cgroupPath)
+	scanner := NewScanner(tmpDir)
+	_, err := scanner.GetContainerMetrics(cgroupPath)
 	if err == nil {
-		t.Error("GetPodMetrics() expected error when metric files missing")
+		t.Error("GetContainerMetrics() expected error when metric files missing")
 	}
 }
 
@@ -165,12 +165,12 @@ pgfault 999999
 		t.Fatalf("Failed to write test file: %v", err)
 	}
 
-	collector := &Collector{
+	scanner := &Scanner{
 		cgroupRoot: tmpDir,
 		vmstatPath: vmstatPath,
 	}
 
-	stats, err := collector.GetSwapIOStats()
+	stats, err := scanner.GetSwapIOStats()
 	if err != nil {
 		t.Fatalf("GetSwapIOStats() error = %v", err)
 	}
@@ -195,12 +195,12 @@ pgfault 999999
 		t.Fatalf("Failed to write test file: %v", err)
 	}
 
-	collector := &Collector{
+	scanner := &Scanner{
 		cgroupRoot: tmpDir,
 		vmstatPath: vmstatPath,
 	}
 
-	stats, err := collector.GetSwapIOStats()
+	stats, err := scanner.GetSwapIOStats()
 	if err != nil {
 		t.Fatalf("GetSwapIOStats() error = %v", err)
 	}
@@ -228,8 +228,8 @@ func TestValidateEnvironment(t *testing.T) {
 			t.Fatalf("Failed to create memory.swap.max: %v", err)
 		}
 
-		collector := NewCollector(tmpDir)
-		if err := collector.ValidateEnvironment(); err != nil {
+		scanner := NewScanner(tmpDir)
+		if err := scanner.ValidateEnvironment(); err != nil {
 			t.Errorf("ValidateEnvironment() unexpected error: %v", err)
 		}
 	})
@@ -238,8 +238,8 @@ func TestValidateEnvironment(t *testing.T) {
 		tmpDir := t.TempDir()
 		// Don't create cgroup.controllers
 
-		collector := NewCollector(tmpDir)
-		err := collector.ValidateEnvironment()
+		scanner := NewScanner(tmpDir)
+		err := scanner.ValidateEnvironment()
 		if err == nil {
 			t.Error("ValidateEnvironment() expected error for missing cgroup v2")
 		}
@@ -253,8 +253,8 @@ func TestValidateEnvironment(t *testing.T) {
 			t.Fatalf("Failed to create cgroup.controllers: %v", err)
 		}
 
-		collector := NewCollector(tmpDir)
-		err := collector.ValidateEnvironment()
+		scanner := NewScanner(tmpDir)
+		err := scanner.ValidateEnvironment()
 		if err == nil {
 			t.Error("ValidateEnvironment() expected error for missing kubepods.slice")
 		}
@@ -271,8 +271,8 @@ func TestValidateEnvironment(t *testing.T) {
 			t.Fatalf("Failed to create kubepods.slice: %v", err)
 		}
 
-		collector := NewCollector(tmpDir)
-		err := collector.ValidateEnvironment()
+		scanner := NewScanner(tmpDir)
+		err := scanner.ValidateEnvironment()
 		if err == nil {
 			t.Error("ValidateEnvironment() expected error for missing swap support")
 		}
@@ -297,8 +297,8 @@ func TestFindPodCgroups(t *testing.T) {
 			}
 		}
 
-		collector := NewCollector(tmpDir)
-		result, err := collector.FindPodCgroups()
+		scanner := NewScanner(tmpDir)
+		result, err := scanner.FindPodCgroups()
 		if err != nil {
 			t.Fatalf("FindPodCgroups() error = %v", err)
 		}
@@ -316,10 +316,10 @@ func TestFindPodCgroups(t *testing.T) {
 
 		paths := []string{
 			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-abc123.scope",
-			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/init.scope",             // unrecognized .scope
-			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod456.slice/docker-def456.scope",    // unrecognized .scope
-			"kubepods.slice/kubepods-burstable.slice/some-other-dir",                                         // not a .scope, ignored
-			"kubepods.slice/system.slice",                                                                    // not a .scope dir, ignored
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/init.scope",          // unrecognized .scope
+			"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod456.slice/docker-def456.scope", // unrecognized .scope
+			"kubepods.slice/kubepods-burstable.slice/some-other-dir",                                      // not a .scope, ignored
+			"kubepods.slice/system.slice",                                                                 // not a .scope dir, ignored
 		}
 
 		for _, p := range paths {
@@ -329,8 +329,8 @@ func TestFindPodCgroups(t *testing.T) {
 			}
 		}
 
-		collector := NewCollector(tmpDir)
-		result, err := collector.FindPodCgroups()
+		scanner := NewScanner(tmpDir)
+		result, err := scanner.FindPodCgroups()
 		if err != nil {
 			t.Fatalf("FindPodCgroups() error = %v", err)
 		}
@@ -347,10 +347,109 @@ func TestFindPodCgroups(t *testing.T) {
 		tmpDir := t.TempDir()
 		// Don't create kubepods.slice
 
-		collector := NewCollector(tmpDir)
-		_, err := collector.FindPodCgroups()
+		scanner := NewScanner(tmpDir)
+		_, err := scanner.FindPodCgroups()
 		if err == nil {
 			t.Error("FindPodCgroups() expected error when kubepods.slice missing")
 		}
 	})
+}
+
+func TestExtractPodUID(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{
+			name:     "burstable pod",
+			path:     "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod12345678_1234_1234_1234_123456789abc.slice/cri-containerd-abc.scope",
+			expected: "12345678-1234-1234-1234-123456789abc",
+		},
+		{
+			name:     "besteffort pod",
+			path:     "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc_def_123.slice/cri-containerd-xyz.scope",
+			expected: "abc-def-123",
+		},
+		{
+			name:     "no pod marker",
+			path:     "kubepods.slice/kubepods-burstable.slice/cri-containerd-abc.scope",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ExtractPodUID(tt.path)
+			if result != tt.expected {
+				t.Errorf("ExtractPodUID(%q) = %q, want %q", tt.path, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractQoS(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{
+			name:     "burstable",
+			path:     "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-abc.scope",
+			expected: "burstable",
+		},
+		{
+			name:     "besteffort",
+			path:     "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice/cri-containerd-abc.scope",
+			expected: "besteffort",
+		},
+		{
+			name:     "guaranteed",
+			path:     "kubepods.slice/kubepods-pod123.slice/cri-containerd-abc.scope",
+			expected: "guaranteed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ExtractQoS(tt.path)
+			if result != tt.expected {
+				t.Errorf("ExtractQoS(%q) = %q, want %q", tt.path, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsBurstable(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{
+			name:     "burstable",
+			path:     "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-abc.scope",
+			expected: true,
+		},
+		{
+			name:     "besteffort",
+			path:     "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice/cri-containerd-abc.scope",
+			expected: false,
+		},
+		{
+			name:     "guaranteed",
+			path:     "kubepods.slice/kubepods-pod123.slice/cri-containerd-abc.scope",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsBurstable(tt.path)
+			if result != tt.expected {
+				t.Errorf("IsBurstable(%q) = %v, want %v", tt.path, result, tt.expected)
+			}
+		})
+	}
 }

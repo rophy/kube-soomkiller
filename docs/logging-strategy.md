@@ -104,16 +104,16 @@ I0202 12:34:56.789012   12345 controller.go:100] "Deleted pod" pod="default/my-p
 - [x] Warning for abnormalities
 
 ### Phase 2: Migrate to structured logging
-- [ ] Replace `klog.Infof` with `klog.InfoS`
-- [ ] Replace `klog.Errorf` with `klog.ErrorS`
-- [ ] Replace `klog.Warningf` with `klog.InfoS` at appropriate level or keep as warning
-- [ ] Use `klog.KRef()` and `klog.KObj()` for Kubernetes objects
+- [x] Replace `klog.Infof` with `klog.InfoS`
+- [x] Replace `klog.Errorf` with `klog.ErrorS`
+- [x] Replace `klog.Warningf` with `klog.InfoS` at appropriate level or keep as warning
+- [x] Use `klog.KRef()` and `klog.KObj()` for Kubernetes objects
 
 ### Phase 3: Message style cleanup
-- [ ] Fix message capitalization
-- [ ] Change to past tense
-- [ ] Remove ending punctuation
-- [ ] Ensure object types are specified
+- [x] Fix message capitalization
+- [x] Change to past tense
+- [x] Remove ending punctuation
+- [x] Ensure object types are specified
 
 ## Error Handling
 

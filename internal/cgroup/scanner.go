@@ -1,4 +1,4 @@
-package metrics
+package cgroup
 
 import (
 	"bufio"
@@ -11,59 +11,37 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// PSI represents Pressure Stall Information for a cgroup
-type PSI struct {
-	SomeAvg10  float64
-	SomeAvg60  float64
-	SomeAvg300 float64
-	SomeTotal  uint64
-	FullAvg10  float64
-	FullAvg60  float64
-	FullAvg300 float64
-	FullTotal  uint64
+// Scanner handles cgroup filesystem operations
+type Scanner struct {
+	cgroupRoot string
+	vmstatPath string
 }
 
-// SwapIOStats represents node-level swap I/O counters from /proc/vmstat
-type SwapIOStats struct {
-	PswpIn  uint64 // pages swapped in (cumulative)
-	PswpOut uint64 // pages swapped out (cumulative)
-}
-
-// ContainerMetrics contains memory-related metrics for a container
-type ContainerMetrics struct {
-	CgroupPath    string
-	SwapCurrent   int64 // bytes
-	MemoryCurrent int64 // bytes
-	MemoryMax     int64 // bytes (memory.max limit)
-	PSI           PSI
-}
-
-// Collector gathers metrics from cgroups and /proc/vmstat
-type Collector struct {
-	cgroupRoot  string
-	vmstatPath  string
-}
-
-// NewCollector creates a new metrics collector
-func NewCollector(cgroupRoot string) *Collector {
-	return &Collector{
+// NewScanner creates a new cgroup scanner
+func NewScanner(cgroupRoot string) *Scanner {
+	return &Scanner{
 		cgroupRoot: cgroupRoot,
 		vmstatPath: "/proc/vmstat",
 	}
 }
 
+// CgroupRoot returns the cgroup root path
+func (s *Scanner) CgroupRoot() string {
+	return s.cgroupRoot
+}
+
 // ValidateEnvironment checks that the system meets requirements:
 // - cgroup v2 (unified hierarchy)
 // - systemd cgroup driver (kubepods.slice layout)
-func (c *Collector) ValidateEnvironment() error {
+func (s *Scanner) ValidateEnvironment() error {
 	// Check for cgroup v2: look for cgroup.controllers file
-	cgroupControllers := filepath.Join(c.cgroupRoot, "cgroup.controllers")
+	cgroupControllers := filepath.Join(s.cgroupRoot, "cgroup.controllers")
 	if _, err := os.Stat(cgroupControllers); os.IsNotExist(err) {
 		return fmt.Errorf("cgroup v2 not detected: %s not found (cgroup v1 is not supported)", cgroupControllers)
 	}
 
 	// Check for systemd cgroup driver: look for kubepods.slice directory
-	kubepodsSlice := filepath.Join(c.cgroupRoot, "kubepods.slice")
+	kubepodsSlice := filepath.Join(s.cgroupRoot, "kubepods.slice")
 	if _, err := os.Stat(kubepodsSlice); os.IsNotExist(err) {
 		return fmt.Errorf("systemd cgroup driver not detected: %s not found (cgroupfs driver is not supported)", kubepodsSlice)
 	}
@@ -77,8 +55,8 @@ func (c *Collector) ValidateEnvironment() error {
 	return nil
 }
 
-// CgroupsResult contains the results of cgroup discovery
-type CgroupsResult struct {
+// ScanResult contains the results of cgroup discovery
+type ScanResult struct {
 	// Recognized cgroup paths matching known container runtimes
 	Cgroups []string
 	// Unrecognized .scope directories that don't match known patterns
@@ -88,10 +66,10 @@ type CgroupsResult struct {
 // FindPodCgroups finds all container cgroup paths under kubepods.slice
 // Supports both containerd (cri-containerd-) and CRI-O (crio-) runtimes
 // Layout: kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice/<runtime>-<id>.scope
-func (c *Collector) FindPodCgroups() (*CgroupsResult, error) {
-	result := &CgroupsResult{}
+func (s *Scanner) FindPodCgroups() (*ScanResult, error) {
+	result := &ScanResult{}
 
-	kubepodsPath := filepath.Join(c.cgroupRoot, "kubepods.slice")
+	kubepodsPath := filepath.Join(s.cgroupRoot, "kubepods.slice")
 	if _, err := os.Stat(kubepodsPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("kubepods.slice not found at %s", kubepodsPath)
 	}
@@ -111,7 +89,7 @@ func (c *Collector) FindPodCgroups() (*CgroupsResult, error) {
 			return nil
 		}
 
-		relPath, _ := filepath.Rel(c.cgroupRoot, path)
+		relPath, _ := filepath.Rel(s.cgroupRoot, path)
 
 		// Match container cgroup directories:
 		// - containerd: cri-containerd-<id>.scope
@@ -128,52 +106,30 @@ func (c *Collector) FindPodCgroups() (*CgroupsResult, error) {
 	return result, err
 }
 
-// GetSwapIOStats retrieves swap I/O counters from /proc/vmstat
-func (c *Collector) GetSwapIOStats() (*SwapIOStats, error) {
-	file, err := os.Open(c.vmstatPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open %s: %w", c.vmstatPath, err)
-	}
-	defer file.Close()
+// PSI represents Pressure Stall Information for a cgroup
+type PSI struct {
+	SomeAvg10  float64
+	SomeAvg60  float64
+	SomeAvg300 float64
+	SomeTotal  uint64
+	FullAvg10  float64
+	FullAvg60  float64
+	FullAvg300 float64
+	FullTotal  uint64
+}
 
-	stats := &SwapIOStats{}
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-
-		switch fields[0] {
-		case "pswpin":
-			val, err := strconv.ParseUint(fields[1], 10, 64)
-			if err != nil {
-				klog.Warningf("Failed to parse pswpin value %q: %v", fields[1], err)
-			} else {
-				stats.PswpIn = val
-			}
-		case "pswpout":
-			val, err := strconv.ParseUint(fields[1], 10, 64)
-			if err != nil {
-				klog.Warningf("Failed to parse pswpout value %q: %v", fields[1], err)
-			} else {
-				stats.PswpOut = val
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", c.vmstatPath, err)
-	}
-
-	return stats, nil
+// ContainerMetrics contains memory-related metrics for a container
+type ContainerMetrics struct {
+	CgroupPath    string
+	SwapCurrent   int64 // bytes
+	MemoryCurrent int64 // bytes
+	MemoryMax     int64 // bytes (memory.max limit)
+	PSI           PSI
 }
 
 // GetContainerMetrics retrieves metrics for a container given its cgroup path
-func (c *Collector) GetContainerMetrics(cgroupPath string) (*ContainerMetrics, error) {
-	fullPath := filepath.Join(c.cgroupRoot, cgroupPath)
+func (s *Scanner) GetContainerMetrics(cgroupPath string) (*ContainerMetrics, error) {
+	fullPath := filepath.Join(s.cgroupRoot, cgroupPath)
 
 	metrics := &ContainerMetrics{
 		CgroupPath: cgroupPath,
@@ -201,7 +157,7 @@ func (c *Collector) GetContainerMetrics(cgroupPath string) (*ContainerMetrics, e
 	metrics.MemoryMax = memoryMax
 
 	// Read memory.pressure (PSI)
-	psi, err := c.readPSI(filepath.Join(fullPath, "memory.pressure"))
+	psi, err := readPSI(filepath.Join(fullPath, "memory.pressure"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read memory.pressure: %w", err)
 	}
@@ -210,7 +166,109 @@ func (c *Collector) GetContainerMetrics(cgroupPath string) (*ContainerMetrics, e
 	return metrics, nil
 }
 
-func (c *Collector) readPSI(path string) (*PSI, error) {
+// SwapIOStats represents node-level swap I/O counters from /proc/vmstat
+type SwapIOStats struct {
+	PswpIn  uint64 // pages swapped in (cumulative)
+	PswpOut uint64 // pages swapped out (cumulative)
+}
+
+// GetSwapIOStats retrieves swap I/O counters from /proc/vmstat
+func (s *Scanner) GetSwapIOStats() (*SwapIOStats, error) {
+	file, err := os.Open(s.vmstatPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open %s: %w", s.vmstatPath, err)
+	}
+	defer file.Close()
+
+	stats := &SwapIOStats{}
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+
+		switch fields[0] {
+		case "pswpin":
+			val, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				klog.InfoS("Failed to parse pswpin value", "value", fields[1], "err", err)
+			} else {
+				stats.PswpIn = val
+			}
+		case "pswpout":
+			val, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				klog.InfoS("Failed to parse pswpout value", "value", fields[1], "err", err)
+			} else {
+				stats.PswpOut = val
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", s.vmstatPath, err)
+	}
+
+	return stats, nil
+}
+
+// ExtractPodUID extracts the pod UID from a cgroup path
+// Input: kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<UID>.slice/...
+// Returns UID with dashes (e.g., "b47ed05b-d1f1-4318-a7ea-f4c6015264b6")
+func ExtractPodUID(cgroupPath string) string {
+	// Look for "pod" prefix in path components
+	parts := strings.Split(cgroupPath, "/")
+	for _, part := range parts {
+		// Match patterns like "kubepods-burstable-pod<UID>.slice" or "kubepods-pod<UID>.slice"
+		if !strings.HasSuffix(part, ".slice") {
+			continue
+		}
+		part = strings.TrimSuffix(part, ".slice")
+
+		// Find "pod" marker
+		podIdx := strings.LastIndex(part, "-pod")
+		if podIdx == -1 {
+			continue
+		}
+
+		// Extract UID after "-pod"
+		uid := part[podIdx+4:] // skip "-pod"
+		if uid == "" {
+			continue
+		}
+
+		// Convert underscores to dashes (cgroup uses underscores)
+		uid = strings.ReplaceAll(uid, "_", "-")
+		return uid
+	}
+	return ""
+}
+
+// ExtractQoS extracts the QoS class from a cgroup path
+// Returns "burstable", "besteffort", or "guaranteed"
+func ExtractQoS(cgroupPath string) string {
+	if strings.Contains(cgroupPath, "kubepods-burstable") {
+		return "burstable"
+	}
+	if strings.Contains(cgroupPath, "kubepods-besteffort") {
+		return "besteffort"
+	}
+	// Guaranteed pods are directly under kubepods.slice without QoS subdirectory
+	if strings.Contains(cgroupPath, "kubepods.slice") {
+		return "guaranteed"
+	}
+	return ""
+}
+
+// IsBurstable checks if the cgroup path is for a burstable pod
+func IsBurstable(cgroupPath string) bool {
+	return strings.Contains(cgroupPath, "kubepods-burstable")
+}
+
+func readPSI(path string) (*PSI, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err

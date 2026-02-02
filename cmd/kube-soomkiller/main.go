@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rophy/kube-soomkiller/internal/cgroup"
 	"github.com/rophy/kube-soomkiller/internal/controller"
 	"github.com/rophy/kube-soomkiller/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
@@ -70,12 +71,21 @@ func main() {
 		klog.Fatalf("--swap-threshold-percent must be >= 0, got %f", swapThresholdPercent)
 	}
 
-	klog.Infof("Starting kube-soomkiller on node %s", nodeName)
-	klog.Infof("Config: poll-interval=%s, swap-threshold-percent=%.1f%%, dry-run=%v",
-		pollInterval, swapThresholdPercent, dryRun)
+	klog.InfoS("Starting kube-soomkiller", "node", nodeName, "version", version)
+	klog.InfoS("Configuration loaded", "pollInterval", pollInterval, "swapThresholdPercent", swapThresholdPercent, "dryRun", dryRun)
+
+	// Create cgroup scanner
+	cgroupScanner := cgroup.NewScanner(cgroupRoot)
+
+	// Validate environment (cgroup v2, systemd, swap enabled)
+	if err := cgroupScanner.ValidateEnvironment(); err != nil {
+		klog.Fatalf("Environment validation failed: %v", err)
+	}
+	klog.InfoS("Environment validated", "cgroupVersion", "v2", "cgroupDriver", "systemd", "swapEnabled", true)
 
 	// Register Prometheus metrics
 	metrics.RegisterMetrics()
+	metrics.RegisterSwapIOCollector(cgroupScanner)
 
 	// Set config metrics
 	metrics.ConfigSwapThresholdPercent.Set(swapThresholdPercent)
@@ -92,9 +102,9 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("ok"))
 		})
-		klog.Infof("Starting metrics server on %s", metricsAddr)
+		klog.InfoS("Metrics server started", "addr", metricsAddr)
 		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
-			klog.Errorf("Metrics server error: %v", err)
+			klog.ErrorS(err, "Metrics server failed")
 		}
 	}()
 
@@ -103,15 +113,6 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
-
-	// Create metrics collector
-	metricsCollector := metrics.NewCollector(cgroupRoot)
-
-	// Validate environment (cgroup v2, systemd, swap enabled)
-	if err := metricsCollector.ValidateEnvironment(); err != nil {
-		klog.Fatalf("Environment validation failed: %v", err)
-	}
-	klog.Info("Environment validated: cgroup v2, systemd cgroup driver, swap enabled")
 
 	// Parse protected namespaces
 	var protectedNSList []string
@@ -136,6 +137,12 @@ func main() {
 	// Create node-scoped pod informer
 	podInformer := controller.NewPodInformer(k8sClient, nodeName, 30*time.Second)
 
+	// Create PodLookup adapter for metrics collector
+	podLookup := &podLookupAdapter{informer: podInformer}
+
+	// Register per-pod swap metrics collector
+	metrics.RegisterSwapMetricsCollector(cgroupScanner, podLookup)
+
 	// Create controller
 	ctrl := controller.New(controller.Config{
 		NodeName:             nodeName,
@@ -144,7 +151,7 @@ func main() {
 		DryRun:               dryRun,
 		ProtectedNamespaces:  protectedNSList,
 		K8sClient:            k8sClient,
-		Metrics:              metricsCollector,
+		CgroupScanner:        cgroupScanner,
 		EventRecorder:        eventRecorder,
 		PodInformer:          podInformer,
 	})
@@ -158,7 +165,7 @@ func main() {
 
 	go func() {
 		sig := <-sigCh
-		klog.Infof("Received signal %s, shutting down", sig)
+		klog.InfoS("Received signal, shutting down", "signal", sig)
 		cancel()
 	}()
 
@@ -166,18 +173,18 @@ func main() {
 	go podInformer.Run(ctx.Done())
 
 	// Wait for informer cache to sync before starting controller
-	klog.Info("Waiting for pod informer cache to sync...")
+	klog.InfoS("Waiting for pod informer cache to sync")
 	if !podInformer.WaitForCacheSync(ctx.Done()) {
 		klog.Fatal("Failed to sync pod informer cache")
 	}
-	klog.Info("Pod informer cache synced")
+	klog.InfoS("Pod informer cache synced")
 
 	// Run controller
 	if err := ctrl.Run(ctx); err != nil {
 		klog.Fatalf("Controller error: %v", err)
 	}
 
-	klog.Info("kube-soomkiller stopped")
+	klog.InfoS("Controller stopped")
 }
 
 func createK8sClient(kubeconfig string) (*kubernetes.Clientset, error) {
@@ -201,4 +208,21 @@ func getEnvBool(key string, defaultVal bool) bool {
 		return val == "true" || val == "1"
 	}
 	return defaultVal
+}
+
+// podLookupAdapter adapts PodInformer to the metrics.PodLookup interface
+type podLookupAdapter struct {
+	informer *controller.PodInformer
+}
+
+func (a *podLookupAdapter) GetPodByUID(uid string) *metrics.PodInfo {
+	pod := a.informer.GetPodByUID(uid)
+	if pod == nil {
+		return nil
+	}
+	return &metrics.PodInfo{
+		UID:       string(pod.UID),
+		Namespace: pod.Namespace,
+		Name:      pod.Name,
+	}
 }

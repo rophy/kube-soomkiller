@@ -52,10 +52,12 @@ setup() {
     # Check for expected metrics
     local missing=""
 
-    echo "$metrics" | grep -q "soomkiller_swap_io_rate" || missing="$missing swap_io_rate"
+    echo "$metrics" | grep -q "soomkiller_node_swap_in_pages_total" || missing="$missing node_swap_in_pages_total"
+    echo "$metrics" | grep -q "soomkiller_node_swap_out_pages_total" || missing="$missing node_swap_out_pages_total"
     echo "$metrics" | grep -q "soomkiller_pods_killed_total" || missing="$missing pods_killed_total"
     echo "$metrics" | grep -q "soomkiller_config_swap_threshold_percent" || missing="$missing config_swap_threshold_percent"
     echo "$metrics" | grep -q "soomkiller_config_dry_run" || missing="$missing config_dry_run"
+    echo "$metrics" | grep -q "soomkiller_candidate_pods_count" || missing="$missing candidate_pods_count"
 
     if [[ -n "$missing" ]]; then
         echo "ERROR: Missing metrics:$missing"
@@ -144,9 +146,9 @@ setup() {
         fi
     fi
 
-    # Check logs for swap detection (either active swap I/O or found pods using swap)
+    # Check logs for swap detection (found pods over threshold or deleted)
     local detected_swap=false
-    if echo "$logs" | grep -qE "(Swap I/O detected|pods using swap)"; then
+    if echo "$logs" | grep -qE "(pods over threshold|Deleted pod)"; then
         detected_swap=true
     fi
 
@@ -160,7 +162,7 @@ setup() {
     # Show relevant logs
     if [[ -n "$logs" ]]; then
         echo "# Relevant logs:"
-        echo "$logs" | grep -E "(Swap I/O|pods using swap|over threshold|memory-hog)" | tail -10 || true
+        echo "$logs" | grep -E "(over threshold|memory-hog|Deleted pod)" | tail -10 || true
     fi
 
     # Show event if found
@@ -174,7 +176,7 @@ setup() {
 
     # Fail if swap was not detected
     if ! $detected_swap; then
-        echo "ERROR: Swap I/O was not detected by soomkiller"
+        echo "ERROR: Pod swap detection failed (no pods over threshold or deleted)"
         echo "# Check vm.swappiness on worker node (must be > 0):"
         kubectl get nodes -o name | head -1 | xargs -I{} kubectl debug {} -it --image=busybox -- cat /proc/sys/vm/swappiness 2>/dev/null || true
         false
