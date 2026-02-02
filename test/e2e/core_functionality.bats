@@ -57,7 +57,7 @@ setup() {
     echo "$metrics" | grep -q "soomkiller_pods_killed_total" || missing="$missing pods_killed_total"
     echo "$metrics" | grep -q "soomkiller_config_swap_threshold_percent" || missing="$missing config_swap_threshold_percent"
     echo "$metrics" | grep -q "soomkiller_config_dry_run" || missing="$missing config_dry_run"
-    echo "$metrics" | grep -q "soomkiller_candidate_pods_count" || missing="$missing candidate_pods_count"
+    # Note: soomkiller_container_* metrics only appear when containers are using swap
 
     if [[ -n "$missing" ]]; then
         echo "ERROR: Missing metrics:$missing"

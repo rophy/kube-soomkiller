@@ -137,11 +137,8 @@ func main() {
 	// Create node-scoped pod informer
 	podInformer := controller.NewPodInformer(k8sClient, nodeName, 30*time.Second)
 
-	// Create PodLookup adapter for metrics collector
-	podLookup := &podLookupAdapter{informer: podInformer}
-
-	// Register per-pod swap metrics collector
-	metrics.RegisterSwapMetricsCollector(cgroupScanner, podLookup)
+	// Register per-container metrics collector (uses informer for pod lookup)
+	metrics.RegisterContainerMetricsCollector(cgroupScanner, podInformer)
 
 	// Create controller
 	ctrl := controller.New(controller.Config{
@@ -208,21 +205,4 @@ func getEnvBool(key string, defaultVal bool) bool {
 		return val == "true" || val == "1"
 	}
 	return defaultVal
-}
-
-// podLookupAdapter adapts PodInformer to the metrics.PodLookup interface
-type podLookupAdapter struct {
-	informer *controller.PodInformer
-}
-
-func (a *podLookupAdapter) GetPodByUID(uid string) *metrics.PodInfo {
-	pod := a.informer.GetPodByUID(uid)
-	if pod == nil {
-		return nil
-	}
-	return &metrics.PodInfo{
-		UID:       string(pod.UID),
-		Namespace: pod.Namespace,
-		Name:      pod.Name,
-	}
 }

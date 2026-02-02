@@ -268,6 +268,33 @@ func IsBurstable(cgroupPath string) bool {
 	return strings.Contains(cgroupPath, "kubepods-burstable")
 }
 
+// ExtractContainerID extracts the container ID from a cgroup path
+// Input: .../cri-containerd-<id>.scope or .../crio-<id>.scope
+// Returns the container ID (e.g., "abc123...")
+func ExtractContainerID(cgroupPath string) string {
+	parts := strings.Split(cgroupPath, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+
+	// Get the last component (e.g., "cri-containerd-abc123.scope")
+	scope := parts[len(parts)-1]
+	if !strings.HasSuffix(scope, ".scope") {
+		return ""
+	}
+	scope = strings.TrimSuffix(scope, ".scope")
+
+	// Extract container ID based on runtime prefix
+	if strings.HasPrefix(scope, "cri-containerd-") {
+		return strings.TrimPrefix(scope, "cri-containerd-")
+	}
+	if strings.HasPrefix(scope, "crio-") {
+		return strings.TrimPrefix(scope, "crio-")
+	}
+
+	return ""
+}
+
 func readPSI(path string) (*PSI, error) {
 	file, err := os.Open(path)
 	if err != nil {

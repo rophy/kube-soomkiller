@@ -1,8 +1,11 @@
 package metrics
 
 import (
+	"strings"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rophy/kube-soomkiller/internal/cgroup"
+	corev1 "k8s.io/api/core/v1"
 )
 
 const (
@@ -96,78 +99,66 @@ func RegisterSwapIOCollector(scanner *cgroup.Scanner) {
 	prometheus.MustRegister(NewSwapIOCollector(scanner))
 }
 
-// PodInfo contains basic pod identification info
-type PodInfo struct {
-	UID       string
-	Namespace string
-	Name      string
-}
-
-// PodLookup is an interface for looking up pod info by UID
+// PodLookup is an interface for looking up pods by UID
 type PodLookup interface {
-	GetPodByUID(uid string) *PodInfo
+	GetPodByUID(uid string) *corev1.Pod
 }
 
-// SwapMetricsCollector exposes per-pod swap metrics on-demand
-type SwapMetricsCollector struct {
-	scanner            *cgroup.Scanner
-	podLookup          PodLookup
+// ContainerMetricsCollector exposes per-container metrics on-demand
+type ContainerMetricsCollector struct {
+	scanner   *cgroup.Scanner
+	podLookup PodLookup
+
 	swapBytesDesc      *prometheus.Desc
-	swapPercentDesc    *prometheus.Desc
 	memoryMaxDesc      *prometheus.Desc
-	candidateCountDesc *prometheus.Desc
+	psiSomeAvg10Desc   *prometheus.Desc
+	psiFullAvg10Desc   *prometheus.Desc
 }
 
-// NewSwapMetricsCollector creates a collector for per-pod swap metrics
-func NewSwapMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup) *SwapMetricsCollector {
-	return &SwapMetricsCollector{
+// NewContainerMetricsCollector creates a collector for per-container metrics
+func NewContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup) *ContainerMetricsCollector {
+	labels := []string{"namespace", "pod", "container"}
+
+	return &ContainerMetricsCollector{
 		scanner:   scanner,
 		podLookup: podLookup,
 		swapBytesDesc: prometheus.NewDesc(
-			namespace+"_pod_swap_bytes",
-			"Current swap usage in bytes per pod",
-			[]string{"namespace", "pod"}, nil,
-		),
-		swapPercentDesc: prometheus.NewDesc(
-			namespace+"_pod_swap_percent",
-			"Max swap usage percentage across containers in pod",
-			[]string{"namespace", "pod"}, nil,
+			namespace+"_container_swap_bytes",
+			"Current swap usage in bytes per container",
+			labels, nil,
 		),
 		memoryMaxDesc: prometheus.NewDesc(
-			namespace+"_pod_memory_max_bytes",
-			"Memory limit in bytes per pod",
-			[]string{"namespace", "pod"}, nil,
+			namespace+"_container_memory_max_bytes",
+			"Memory limit in bytes per container",
+			labels, nil,
 		),
-		candidateCountDesc: prometheus.NewDesc(
-			namespace+"_candidate_pods_count",
-			"Number of pods currently using swap",
-			nil, nil,
+		psiSomeAvg10Desc: prometheus.NewDesc(
+			namespace+"_container_memory_psi_some_avg10",
+			"Percentage of time at least one task was stalled on memory (10s average)",
+			labels, nil,
+		),
+		psiFullAvg10Desc: prometheus.NewDesc(
+			namespace+"_container_memory_psi_full_avg10",
+			"Percentage of time all tasks were stalled on memory (10s average)",
+			labels, nil,
 		),
 	}
 }
 
 // Describe implements prometheus.Collector
-func (c *SwapMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
+func (c *ContainerMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.swapBytesDesc
-	ch <- c.swapPercentDesc
 	ch <- c.memoryMaxDesc
-	ch <- c.candidateCountDesc
+	ch <- c.psiSomeAvg10Desc
+	ch <- c.psiFullAvg10Desc
 }
 
 // Collect implements prometheus.Collector - scans cgroups on each scrape
-func (c *SwapMetricsCollector) Collect(ch chan<- prometheus.Metric) {
+func (c *ContainerMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	result, err := c.scanner.FindPodCgroups()
 	if err != nil {
 		return
 	}
-
-	// Track pods by UID to aggregate container metrics
-	type podMetrics struct {
-		swapBytes   int64
-		memoryMax   int64
-		swapPercent float64
-	}
-	pods := make(map[string]*podMetrics)
 
 	for _, cgroupPath := range result.Cgroups {
 		// Only burstable pods use swap in LimitedSwap mode
@@ -175,58 +166,78 @@ func (c *SwapMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 
-		uid := cgroup.ExtractPodUID(cgroupPath)
-		if uid == "" {
+		// Extract pod UID and container ID from cgroup path
+		podUID := cgroup.ExtractPodUID(cgroupPath)
+		containerID := cgroup.ExtractContainerID(cgroupPath)
+		if podUID == "" || containerID == "" {
 			continue
 		}
 
-		containerMetrics, err := c.scanner.GetContainerMetrics(cgroupPath)
-		if err != nil || containerMetrics.SwapCurrent == 0 {
+		// Look up pod to get namespace, pod name, and container name
+		pod := c.podLookup.GetPodByUID(podUID)
+		if pod == nil {
 			continue
 		}
 
-		// Calculate swap percentage for this container
-		var swapPercent float64
-		if containerMetrics.MemoryMax > 0 {
-			swapPercent = float64(containerMetrics.SwapCurrent) / float64(containerMetrics.MemoryMax) * 100
-		}
-
-		if existing, ok := pods[uid]; ok {
-			existing.swapBytes += containerMetrics.SwapCurrent
-			existing.memoryMax += containerMetrics.MemoryMax
-			if swapPercent > existing.swapPercent {
-				existing.swapPercent = swapPercent
-			}
-		} else {
-			pods[uid] = &podMetrics{
-				swapBytes:   containerMetrics.SwapCurrent,
-				memoryMax:   containerMetrics.MemoryMax,
-				swapPercent: swapPercent,
-			}
-		}
-	}
-
-	// Emit metrics for pods we can identify
-	candidateCount := 0
-	for uid, pm := range pods {
-		podInfo := c.podLookup.GetPodByUID(uid)
-		if podInfo == nil {
+		// Find container name by matching container ID
+		containerName := findContainerName(pod, containerID)
+		if containerName == "" {
 			continue
 		}
 
-		candidateCount++
+		// Get container metrics from cgroup
+		metrics, err := c.scanner.GetContainerMetrics(cgroupPath)
+		if err != nil {
+			continue
+		}
+
+		// Emit metrics
+		labels := []string{pod.Namespace, pod.Name, containerName}
+
 		ch <- prometheus.MustNewConstMetric(c.swapBytesDesc, prometheus.GaugeValue,
-			float64(pm.swapBytes), podInfo.Namespace, podInfo.Name)
-		ch <- prometheus.MustNewConstMetric(c.swapPercentDesc, prometheus.GaugeValue,
-			pm.swapPercent, podInfo.Namespace, podInfo.Name)
+			float64(metrics.SwapCurrent), labels...)
 		ch <- prometheus.MustNewConstMetric(c.memoryMaxDesc, prometheus.GaugeValue,
-			float64(pm.memoryMax), podInfo.Namespace, podInfo.Name)
+			float64(metrics.MemoryMax), labels...)
+		ch <- prometheus.MustNewConstMetric(c.psiSomeAvg10Desc, prometheus.GaugeValue,
+			metrics.PSI.SomeAvg10, labels...)
+		ch <- prometheus.MustNewConstMetric(c.psiFullAvg10Desc, prometheus.GaugeValue,
+			metrics.PSI.FullAvg10, labels...)
 	}
-
-	ch <- prometheus.MustNewConstMetric(c.candidateCountDesc, prometheus.GaugeValue, float64(candidateCount))
 }
 
-// RegisterSwapMetricsCollector registers the per-pod swap metrics collector
-func RegisterSwapMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup) {
-	prometheus.MustRegister(NewSwapMetricsCollector(scanner, podLookup))
+// findContainerName finds the container name by matching container ID in pod status
+func findContainerName(pod *corev1.Pod, containerID string) string {
+	// Check regular containers
+	for _, cs := range pod.Status.ContainerStatuses {
+		if matchContainerID(cs.ContainerID, containerID) {
+			return cs.Name
+		}
+	}
+
+	// Check init containers
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if matchContainerID(cs.ContainerID, containerID) {
+			return cs.Name
+		}
+	}
+
+	return ""
+}
+
+// matchContainerID checks if the container status ID matches the cgroup container ID
+// Container status ID format: "containerd://abc123..." or "cri-o://abc123..."
+// Cgroup container ID format: "abc123..."
+func matchContainerID(statusID, cgroupID string) bool {
+	// Remove runtime prefix (e.g., "containerd://", "cri-o://")
+	if idx := strings.Index(statusID, "://"); idx != -1 {
+		statusID = statusID[idx+3:]
+	}
+
+	// Container IDs should match (may be truncated in cgroup)
+	return strings.HasPrefix(statusID, cgroupID) || strings.HasPrefix(cgroupID, statusID)
+}
+
+// RegisterContainerMetricsCollector registers the per-container metrics collector
+func RegisterContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup) {
+	prometheus.MustRegister(NewContainerMetricsCollector(scanner, podLookup))
 }
