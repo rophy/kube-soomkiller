@@ -25,6 +25,7 @@ type Config struct {
 	K8sClient            kubernetes.Interface
 	Metrics              *metrics.Collector
 	EventRecorder        record.EventRecorder // optional, for emitting Kubernetes events
+	PodInformer          *PodInformer         // node-scoped pod cache
 }
 
 // Controller monitors swap pressure and terminates pods when necessary
@@ -44,12 +45,10 @@ type Controller struct {
 
 // PodCandidate represents a pod that may be terminated
 type PodCandidate struct {
-	Namespace   string
-	Name        string
-	CgroupPath  string
-	SwapBytes   int64
-	MemoryMax   int64
-	SwapPercent float64 // SwapBytes / MemoryMax * 100
+	UID         string  // Pod UID from cgroup path
+	Namespace   string  // Populated from informer cache
+	Name        string  // Populated from informer cache
+	SwapPercent float64 // Max swap percentage across all containers
 }
 
 // New creates a new controller
@@ -142,23 +141,23 @@ func (c *Controller) reconcile(ctx context.Context) error {
 
 	// Log status periodically (every 30s)
 	if now.Sub(c.lastStatusLogTime) >= 30*time.Second {
-		klog.V(2).Infof("Swap I/O rate=%.1f pages/sec", swapIORate)
+		klog.V(3).Infof("Swap I/O rate=%.1f pages/sec", swapIORate)
 		c.lastStatusLogTime = now
 	}
 
-	// No swap activity = nothing to do
-	if swapIORate == 0 {
-		return nil
+	// Log when swap I/O is detected
+	if swapIORate > 0 {
+		klog.V(1).Infof("Swap I/O detected: %.1f pages/sec", swapIORate)
 	}
 
-	klog.V(1).Infof("Swap I/O detected: %.1f pages/sec, scanning pods", swapIORate)
-
-	// Find and kill pods over threshold
+	// Always scan for pods over threshold (even without active swap I/O,
+	// a pod may already be using swap from a previous burst)
 	return c.findAndKillOverThreshold(ctx)
 }
 
 func (c *Controller) findAndKillOverThreshold(ctx context.Context) error {
-	candidates, err := c.findCandidates(ctx)
+	// Phase 1: Scan cgroups for swap usage (NO API CALL)
+	candidates, err := c.scanCgroupsForSwap()
 	if err != nil {
 		return err
 	}
@@ -166,44 +165,86 @@ func (c *Controller) findAndKillOverThreshold(ctx context.Context) error {
 	// Update candidate count metric
 	metrics.CandidatePodsCount.Set(float64(len(candidates)))
 
-	// Update per-pod metrics
-	metrics.ResetPodMetrics()
-	for _, cand := range candidates {
-		metrics.PodSwapBytes.WithLabelValues(cand.Namespace, cand.Name).Set(float64(cand.SwapBytes))
-		metrics.PodSwapPercent.WithLabelValues(cand.Namespace, cand.Name).Set(cand.SwapPercent)
-		metrics.PodMemoryMax.WithLabelValues(cand.Namespace, cand.Name).Set(float64(cand.MemoryMax))
-	}
-
 	if len(candidates) == 0 {
-		klog.V(2).Info("No pods using swap")
+		klog.V(3).Info("No pods using swap")
+		// Reset per-pod metrics when no candidates
+		metrics.ResetPodMetrics()
 		return nil
 	}
 
-	// Log all candidates
-	klog.Infof("Found %d pods using swap:", len(candidates))
+	// Filter to only pods over threshold
+	var overThreshold []PodCandidate
 	for _, cand := range candidates {
-		overThreshold := ""
 		if cand.SwapPercent > c.config.SwapThresholdPercent {
-			overThreshold = " [OVER THRESHOLD]"
+			overThreshold = append(overThreshold, cand)
 		}
-		klog.Infof("  %s/%s: swap=%.1f%% (%.1fMB / %.1fMB limit)%s",
-			cand.Namespace, cand.Name, cand.SwapPercent,
-			float64(cand.SwapBytes)/1024/1024,
-			float64(cand.MemoryMax)/1024/1024,
-			overThreshold)
+	}
+
+	if len(overThreshold) == 0 {
+		// Log details of candidates at V(3) for debugging
+		for _, cand := range candidates {
+			klog.V(3).Infof("Candidate: uid=%s pct=%.2f%% threshold=%.2f%%",
+				cand.UID, cand.SwapPercent, c.config.SwapThresholdPercent)
+		}
+		klog.V(3).Infof("Found %d pods using swap, none over threshold", len(candidates))
+		// Reset per-pod metrics when no pods over threshold
+		metrics.ResetPodMetrics()
+		return nil
+	}
+
+	// Phase 2: Resolve pod names from informer cache (no API call)
+	klog.V(3).Infof("Found %d pods using swap, %d over threshold", len(candidates), len(overThreshold))
+
+	// Resolve and filter candidates using informer cache
+	var resolved []PodCandidate
+	for _, cand := range overThreshold {
+		pod := c.config.PodInformer.GetPodByUID(cand.UID)
+		if pod == nil {
+			klog.V(3).Infof("Pod UID %s not found in cache, may have been deleted", cand.UID)
+			continue
+		}
+
+		// Skip pods already terminating
+		if pod.DeletionTimestamp != nil {
+			klog.V(3).Infof("Skipping pod %s/%s: already terminating", pod.Namespace, pod.Name)
+			continue
+		}
+
+		// Skip protected namespaces
+		if c.protectedNamespaces[pod.Namespace] {
+			klog.V(3).Infof("Skipping pod %s/%s: namespace is protected", pod.Namespace, pod.Name)
+			continue
+		}
+
+		cand.Namespace = pod.Namespace
+		cand.Name = pod.Name
+		resolved = append(resolved, cand)
+	}
+
+	// Update per-pod metrics now that we have names
+	metrics.ResetPodMetrics()
+	for _, cand := range resolved {
+		metrics.PodSwapPercent.WithLabelValues(cand.Namespace, cand.Name).Set(cand.SwapPercent)
+	}
+
+	if len(resolved) == 0 {
+		klog.V(3).Info("No killable pods after filtering")
+		return nil
+	}
+
+	// Log all resolved candidates
+	klog.Infof("Found %d pods over threshold:", len(resolved))
+	for _, cand := range resolved {
+		klog.Infof("  %s/%s: swap=%.1f%%", cand.Namespace, cand.Name, cand.SwapPercent)
 	}
 
 	// Kill pods over threshold (sorted by swap percent descending)
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].SwapPercent > candidates[j].SwapPercent
+	sort.Slice(resolved, func(i, j int) bool {
+		return resolved[i].SwapPercent > resolved[j].SwapPercent
 	})
 
 	var killed int
-	for _, cand := range candidates {
-		if cand.SwapPercent <= c.config.SwapThresholdPercent {
-			break // Sorted, so remaining are also under threshold
-		}
-
+	for _, cand := range resolved {
 		klog.Warningf("Pod %s/%s over threshold: swap=%.1f%% > %.1f%%",
 			cand.Namespace, cand.Name, cand.SwapPercent, c.config.SwapThresholdPercent)
 
@@ -224,66 +265,9 @@ func (c *Controller) findAndKillOverThreshold(ctx context.Context) error {
 	return nil
 }
 
-func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error) {
-	var candidates []PodCandidate
-
-	// Get all pods on this node
-	pods, err := c.config.K8sClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("spec.nodeName=%s", c.config.NodeName),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	// Build a map of container ID (first 12 chars) to pod info for Burstable pods only
-	type podInfo struct {
-		Namespace string
-		Name      string
-	}
-	containerToPod := make(map[string]podInfo)
-
-	for _, pod := range pods.Items {
-		// Skip pods in protected namespaces
-		if c.protectedNamespaces[pod.Namespace] {
-			klog.V(3).Infof("Skipping pod %s/%s: namespace is protected",
-				pod.Namespace, pod.Name)
-			continue
-		}
-
-		// Skip pods that are already being deleted
-		if pod.DeletionTimestamp != nil {
-			klog.V(3).Infof("Skipping pod %s/%s: already being deleted",
-				pod.Namespace, pod.Name)
-			continue
-		}
-
-		// Only consider Burstable pods - they're the only ones that get swap in LimitedSwap mode
-		if pod.Status.QOSClass != corev1.PodQOSBurstable {
-			klog.V(3).Infof("Skipping pod %s/%s: QoS class is %s (not Burstable)",
-				pod.Namespace, pod.Name, pod.Status.QOSClass)
-			continue
-		}
-
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.ContainerID == "" {
-				continue
-			}
-			// Extract container ID from "containerd://abc123..." or "cri-o://abc123..."
-			containerID := extractContainerIDFromStatus(cs.ContainerID)
-			if containerID == "" {
-				continue
-			}
-			// Use first 12 chars for matching (standard short ID)
-			if len(containerID) > 12 {
-				containerID = containerID[:12]
-			}
-			containerToPod[containerID] = podInfo{
-				Namespace: pod.Namespace,
-				Name:      pod.Name,
-			}
-		}
-	}
-
+// scanCgroupsForSwap scans cgroups for pods using swap without calling the API.
+// It filters by QoS class (burstable only) and returns candidates with swap usage.
+func (c *Controller) scanCgroupsForSwap() ([]PodCandidate, error) {
 	// Find all container cgroups via filesystem walk
 	cgroupsResult, err := c.config.Metrics.FindPodCgroups()
 	if err != nil {
@@ -291,79 +275,62 @@ func (c *Controller) findCandidates(ctx context.Context) ([]PodCandidate, error)
 		return nil, nil
 	}
 
-	// Track processed pods to avoid duplicates (multiple containers per pod)
+	// Track processed pods by UID to avoid duplicates (multiple containers per pod)
 	processedPods := make(map[string]*PodCandidate)
 
 	for _, cgroupPath := range cgroupsResult.Cgroups {
-		// Extract container ID from cgroup path
-		containerID := extractContainerIDFromCgroup(cgroupPath)
-		if containerID == "" {
+		// Filter by QoS: only Burstable pods get swap in LimitedSwap mode
+		qos := extractQoSFromCgroup(cgroupPath)
+		if qos != "burstable" {
+			klog.V(3).Infof("Skipping cgroup %s: QoS is %s (not burstable)", cgroupPath, qos)
 			continue
 		}
 
-		pod, ok := containerToPod[containerID]
-		if !ok {
-			klog.V(3).Infof("Container %s not in Burstable pod list, skipping", containerID)
+		// Extract pod UID from cgroup path
+		uid := extractPodUIDFromCgroup(cgroupPath)
+		if uid == "" {
+			klog.V(3).Infof("Could not extract pod UID from cgroup %s", cgroupPath)
 			continue
 		}
 
-		podMetrics, err := c.config.Metrics.GetPodMetrics(cgroupPath)
+		containerMetrics, err := c.config.Metrics.GetContainerMetrics(cgroupPath)
 		if err != nil {
-			klog.V(2).Infof("Failed to get metrics for %s: %v", cgroupPath, err)
+			klog.V(3).Infof("Failed to get metrics for %s: %v", cgroupPath, err)
 			continue
 		}
 
 		// Skip if not using swap
-		if podMetrics.SwapCurrent == 0 {
+		if containerMetrics.SwapCurrent == 0 {
 			continue
 		}
 
-		// Calculate swap percentage
+		// Calculate swap percentage for THIS container
 		var swapPercent float64
-		if podMetrics.MemoryMax > 0 {
-			swapPercent = float64(podMetrics.SwapCurrent) / float64(podMetrics.MemoryMax) * 100
+		if containerMetrics.MemoryMax > 0 {
+			swapPercent = float64(containerMetrics.SwapCurrent) / float64(containerMetrics.MemoryMax) * 100
 		}
 
-		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-		if existing, ok := processedPods[podKey]; ok {
-			// Aggregate metrics across containers in the same pod
-			existing.SwapBytes += podMetrics.SwapCurrent
-			// Take max memory.max across containers
-			if podMetrics.MemoryMax > existing.MemoryMax {
-				existing.MemoryMax = podMetrics.MemoryMax
-			}
-			// Recalculate percent with aggregated values
-			if existing.MemoryMax > 0 {
-				existing.SwapPercent = float64(existing.SwapBytes) / float64(existing.MemoryMax) * 100
+		if existing, ok := processedPods[uid]; ok {
+			// Pod already seen - take max swap percentage
+			// If ANY container exceeds threshold, the pod should be killed
+			if swapPercent > existing.SwapPercent {
+				existing.SwapPercent = swapPercent
 			}
 		} else {
-			processedPods[podKey] = &PodCandidate{
-				Namespace:   pod.Namespace,
-				Name:        pod.Name,
-				CgroupPath:  cgroupPath,
-				SwapBytes:   podMetrics.SwapCurrent,
-				MemoryMax:   podMetrics.MemoryMax,
+			processedPods[uid] = &PodCandidate{
+				UID:         uid,
 				SwapPercent: swapPercent,
 			}
 		}
 	}
 
 	// Convert map to slice
+	var candidates []PodCandidate
 	for _, cand := range processedPods {
 		candidates = append(candidates, *cand)
 	}
 
 	return candidates, nil
-}
-
-// extractContainerIDFromStatus extracts container ID from Kubernetes container status
-// Input format: "containerd://abc123..." or "cri-o://abc123..."
-func extractContainerIDFromStatus(containerID string) string {
-	idx := strings.Index(containerID, "://")
-	if idx == -1 {
-		return ""
-	}
-	return containerID[idx+3:]
 }
 
 // extractContainerIDFromCgroup extracts the first 12 chars of container ID from cgroup path
@@ -399,6 +366,55 @@ func extractContainerIDFromCgroup(cgroupPath string) string {
 	return fullID
 }
 
+// extractPodUIDFromCgroup extracts the pod UID from cgroup path
+// Input: kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<UID>.slice/...
+// or: kubepods.slice/kubepods-pod<UID>.slice/... (for Guaranteed)
+// Returns UID with dashes (e.g., "b47ed05b-d1f1-4318-a7ea-f4c6015264b6")
+func extractPodUIDFromCgroup(cgroupPath string) string {
+	// Look for "pod" prefix in path components
+	parts := strings.Split(cgroupPath, "/")
+	for _, part := range parts {
+		// Match patterns like "kubepods-burstable-pod<UID>.slice" or "kubepods-pod<UID>.slice"
+		if !strings.HasSuffix(part, ".slice") {
+			continue
+		}
+		part = strings.TrimSuffix(part, ".slice")
+
+		// Find "pod" marker
+		podIdx := strings.LastIndex(part, "-pod")
+		if podIdx == -1 {
+			continue
+		}
+
+		// Extract UID after "-pod"
+		uid := part[podIdx+4:] // skip "-pod"
+		if uid == "" {
+			continue
+		}
+
+		// Convert underscores to dashes (cgroup uses underscores)
+		uid = strings.ReplaceAll(uid, "_", "-")
+		return uid
+	}
+	return ""
+}
+
+// extractQoSFromCgroup extracts the QoS class from cgroup path
+// Returns "burstable", "besteffort", or "guaranteed"
+func extractQoSFromCgroup(cgroupPath string) string {
+	if strings.Contains(cgroupPath, "kubepods-burstable") {
+		return "burstable"
+	}
+	if strings.Contains(cgroupPath, "kubepods-besteffort") {
+		return "besteffort"
+	}
+	// Guaranteed pods are directly under kubepods.slice without QoS subdirectory
+	if strings.Contains(cgroupPath, "kubepods.slice") {
+		return "guaranteed"
+	}
+	return ""
+}
+
 func (c *Controller) terminatePod(ctx context.Context, cand PodCandidate) error {
 	if c.config.DryRun {
 		klog.Infof("[DRY-RUN] Would delete pod %s/%s", cand.Namespace, cand.Name)
@@ -409,14 +425,14 @@ func (c *Controller) terminatePod(ctx context.Context, cand PodCandidate) error 
 
 	// Emit Kubernetes event before deleting (if event recorder is configured)
 	if c.config.EventRecorder != nil {
-		// Get the pod object to attach the event to
-		pod, err := c.config.K8sClient.CoreV1().Pods(cand.Namespace).Get(ctx, cand.Name, metav1.GetOptions{})
-		if err == nil {
+		// Get the pod object from informer cache to attach the event to
+		pod := c.config.PodInformer.GetPodByUID(cand.UID)
+		if pod != nil {
 			c.config.EventRecorder.Eventf(pod, corev1.EventTypeWarning, "Soomkilled",
-				"Pod %s deleted by kube-soomkiller on node %s: swap usage %.1fMiB",
-				cand.Name, c.config.NodeName, float64(cand.SwapBytes)/1024/1024)
+				"Pod %s deleted by kube-soomkiller on node %s: swap usage %.1f%%",
+				cand.Name, c.config.NodeName, cand.SwapPercent)
 		} else {
-			klog.V(2).Infof("Could not get pod %s/%s for event: %v", cand.Namespace, cand.Name, err)
+			klog.Warningf("Could not get pod %s/%s from cache for event", cand.Namespace, cand.Name)
 		}
 	}
 

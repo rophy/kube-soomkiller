@@ -29,8 +29,8 @@ type SwapIOStats struct {
 	PswpOut uint64 // pages swapped out (cumulative)
 }
 
-// PodMetrics contains memory-related metrics for a pod
-type PodMetrics struct {
+// ContainerMetrics contains memory-related metrics for a container
+type ContainerMetrics struct {
 	CgroupPath    string
 	SwapCurrent   int64 // bytes
 	MemoryCurrent int64 // bytes
@@ -171,11 +171,11 @@ func (c *Collector) GetSwapIOStats() (*SwapIOStats, error) {
 	return stats, nil
 }
 
-// GetPodMetrics retrieves metrics for a pod given its cgroup path
-func (c *Collector) GetPodMetrics(cgroupPath string) (*PodMetrics, error) {
+// GetContainerMetrics retrieves metrics for a container given its cgroup path
+func (c *Collector) GetContainerMetrics(cgroupPath string) (*ContainerMetrics, error) {
 	fullPath := filepath.Join(c.cgroupRoot, cgroupPath)
 
-	metrics := &PodMetrics{
+	metrics := &ContainerMetrics{
 		CgroupPath: cgroupPath,
 	}
 

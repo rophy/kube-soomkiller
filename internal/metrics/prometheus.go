@@ -37,22 +37,10 @@ var (
 	})
 
 	// Per-pod metrics (with labels)
-	PodSwapBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "pod_swap_bytes",
-		Help:      "Swap usage in bytes per pod",
-	}, []string{"namespace", "pod"})
-
 	PodSwapPercent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Name:      "pod_swap_percent",
-		Help:      "Swap usage as percentage of memory limit per pod",
-	}, []string{"namespace", "pod"})
-
-	PodMemoryMax = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Name:      "pod_memory_max_bytes",
-		Help:      "Memory limit (memory.max) in bytes per pod",
+		Help:      "Max swap usage percentage across containers in pod",
 	}, []string{"namespace", "pod"})
 
 	// Configuration metrics (for visibility)
@@ -81,9 +69,7 @@ func RegisterMetrics() {
 		CandidatePodsCount,
 
 		// Per-pod
-		PodSwapBytes,
 		PodSwapPercent,
-		PodMemoryMax,
 
 		// Config
 		ConfigSwapThresholdPercent,
@@ -93,7 +79,5 @@ func RegisterMetrics() {
 
 // ResetPodMetrics clears all per-pod metrics (call before updating)
 func ResetPodMetrics() {
-	PodSwapBytes.Reset()
 	PodSwapPercent.Reset()
-	PodMemoryMax.Reset()
 }

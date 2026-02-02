@@ -133,6 +133,9 @@ func main() {
 		Component: "kube-soomkiller",
 	})
 
+	// Create node-scoped pod informer
+	podInformer := controller.NewPodInformer(k8sClient, nodeName, 30*time.Second)
+
 	// Create controller
 	ctrl := controller.New(controller.Config{
 		NodeName:             nodeName,
@@ -143,6 +146,7 @@ func main() {
 		K8sClient:            k8sClient,
 		Metrics:              metricsCollector,
 		EventRecorder:        eventRecorder,
+		PodInformer:          podInformer,
 	})
 
 	// Handle shutdown gracefully
@@ -157,6 +161,16 @@ func main() {
 		klog.Infof("Received signal %s, shutting down", sig)
 		cancel()
 	}()
+
+	// Start pod informer in background
+	go podInformer.Run(ctx.Done())
+
+	// Wait for informer cache to sync before starting controller
+	klog.Info("Waiting for pod informer cache to sync...")
+	if !podInformer.WaitForCacheSync(ctx.Done()) {
+		klog.Fatal("Failed to sync pod informer cache")
+	}
+	klog.Info("Pod informer cache synced")
 
 	// Run controller
 	if err := ctrl.Run(ctx); err != nil {

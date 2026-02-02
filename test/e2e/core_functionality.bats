@@ -144,9 +144,9 @@ setup() {
         fi
     fi
 
-    # Check logs for swap detection
+    # Check logs for swap detection (either active swap I/O or found pods using swap)
     local detected_swap=false
-    if echo "$logs" | grep -q "Swap I/O detected"; then
+    if echo "$logs" | grep -qE "(Swap I/O detected|pods using swap)"; then
         detected_swap=true
     fi
 
