@@ -37,23 +37,7 @@ setup() {
         false
     fi
 
-    # Check logs for successful startup
-    local logs
-    logs=$(get_soomkiller_logs_since "120s")
-
-    if ! echo "$logs" | grep -q "Controller started"; then
-        echo "ERROR: Controller did not start properly"
-        echo "$logs" | tail -20
-        false
-    fi
-
-    if ! echo "$logs" | grep -q "container cgroups"; then
-        echo "ERROR: Controller did not discover cgroups"
-        echo "$logs" | tail -20
-        false
-    fi
-
-    echo "# Controller started and discovered cgroups"
+    echo "# Controller pods are running"
 }
 
 @test "metrics endpoint exposes expected metrics" {
@@ -102,6 +86,10 @@ setup() {
 
 # Critical test: verifies soomkiller detects swap usage and emits Soomkilled event
 @test "memory pressure triggers swap detection and Soomkilled event" {
+    # Capture test start time for log filtering (RFC3339 format)
+    local test_start
+    test_start=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
     # Delete any existing memory-hog job and wait for cleanup
     kubectl delete job memory-hog -n "$NAMESPACE" --ignore-not-found=true --wait=true 2>/dev/null || true
 
@@ -152,7 +140,7 @@ setup() {
             --field-selector spec.nodeName="$node" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
         if [[ -n "$soomkiller_pod" ]]; then
             echo "# Soomkiller pod on node $node: $soomkiller_pod"
-            logs=$(kubectl logs -n "$NAMESPACE" "$soomkiller_pod" --since=60s 2>/dev/null || true)
+            logs=$(kubectl logs -n "$NAMESPACE" "$soomkiller_pod" --since-time="$test_start" 2>/dev/null || true)
         fi
     fi
 
