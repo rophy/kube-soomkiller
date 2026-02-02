@@ -3,4 +3,4 @@ kind: Namespace
 metadata:
   name: kube-soomkiller
   labels:
-    name: kube-soomkiller
+    app.kubernetes.io/name: kube-soomkiller

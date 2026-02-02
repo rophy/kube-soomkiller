@@ -20,11 +20,6 @@ manifests:
 deploy:
   kubectl: {}
 profiles:
-  - name: e2e
-    manifests:
-      rawYaml:
-        - deploy/soomkiller/*.yaml
-        - deploy/e2e/*.yaml
   - name: stress
     manifests:
       rawYaml:

@@ -7,10 +7,10 @@ setup_file() {
     # Default timeout for each test (in seconds)
     export BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
 
-    # Deploy soomkiller + e2e fixtures using skaffold e2e profile
+    # Deploy soomkiller using skaffold (default profile)
     # skaffold run waits for rollout by default
-    echo "# Deploying kube-soomkiller with skaffold (e2e profile)..."
-    (cd "$(get_project_root)" && skaffold run --kube-context "${KUBE_CONTEXT:-k3s}" --profile e2e)
+    echo "# Deploying kube-soomkiller with skaffold..."
+    (cd "$(get_project_root)" && skaffold run --kube-context "${KUBE_CONTEXT:-k3s}")
 
     echo "# Setup complete"
 }
@@ -128,7 +128,7 @@ setup() {
     local event_message=""
     if $event_found; then
         event_message=$(kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled -o jsonpath='{.items[?(@.involvedObject.name=="'"$pod_name"'")].message}' 2>/dev/null || true)
-        node=$(echo "$event_message" | grep -oP 'on node \K[^:]+' || true)
+        node=$(echo "$event_message" | sed -n 's/.*on node \([^:]*\):.*/\1/p' || true)
         echo "# Node (from event): $node"
     fi
 
