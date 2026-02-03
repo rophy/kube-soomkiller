@@ -465,13 +465,6 @@ The controller DaemonSet must be running. If it fails:
 | Kubelet Node Eviction | SIGTERM | Yes | Node-wide threshold |
 | **Soft OOM Killer** | SIGTERM | Yes | Per-pod, swap-aware |
 
-## Future Enhancements
-
-1. **eBPF-based swap I/O tracking** - Per-pod swap I/O attribution
-2. **PodDisruptionBudget awareness** - Optionally respect PDB
-3. **Predictive termination** - Use swap growth rate to predict pressure
-4. **Helm chart** - For easier deployment and configuration
-
 ## References
 
 - [Kubernetes NodeSwap Feature](https://kubernetes.io/docs/concepts/architecture/nodes/#swap-memory)
