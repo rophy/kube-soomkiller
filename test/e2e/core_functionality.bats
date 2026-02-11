@@ -55,7 +55,9 @@ setup() {
     echo "$metrics" | grep -q "soomkiller_node_swap_in_pages_total" || missing="$missing node_swap_in_pages_total"
     echo "$metrics" | grep -q "soomkiller_node_swap_out_pages_total" || missing="$missing node_swap_out_pages_total"
     echo "$metrics" | grep -q "soomkiller_pods_killed_total" || missing="$missing pods_killed_total"
+    echo "$metrics" | grep -q "soomkiller_config_memory_threshold_percent" || missing="$missing config_memory_threshold_percent"
     echo "$metrics" | grep -q "soomkiller_config_swap_threshold_percent" || missing="$missing config_swap_threshold_percent"
+    echo "$metrics" | grep -q "soomkiller_config_file_cache_threshold_percent" || missing="$missing config_file_cache_threshold_percent"
     echo "$metrics" | grep -q "soomkiller_config_dry_run" || missing="$missing config_dry_run"
     # Note: soomkiller_container_* metrics only appear when containers are using swap
 
