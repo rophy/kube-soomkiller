@@ -125,6 +125,7 @@ type ContainerMetrics struct {
 	SwapMax       int64 // bytes (memory.swap.max limit)
 	MemoryCurrent int64 // bytes (memory.current)
 	MemoryMax     int64 // bytes (memory.max limit)
+	FileCache     int64 // bytes (from memory.stat "file" field)
 	PSI           PSI
 }
 
@@ -163,6 +164,13 @@ func (s *Scanner) GetContainerMetrics(cgroupPath string) (*ContainerMetrics, err
 		return nil, fmt.Errorf("failed to read memory.max: %w", err)
 	}
 	metrics.MemoryMax = memoryMax
+
+	// Read file cache from memory.stat
+	fileCache, err := readFileCacheFromMemoryStat(filepath.Join(fullPath, "memory.stat"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read memory.stat: %w", err)
+	}
+	metrics.FileCache = fileCache
 
 	// Read memory.pressure (PSI)
 	psi, err := readPSI(filepath.Join(fullPath, "memory.pressure"))
@@ -301,6 +309,27 @@ func ExtractContainerID(cgroupPath string) string {
 	}
 
 	return ""
+}
+
+// readFileCacheFromMemoryStat parses memory.stat and returns the "file" (page cache) value in bytes
+func readFileCacheFromMemoryStat(path string) (int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 2 && fields[0] == "file" {
+			return strconv.ParseInt(fields[1], 10, 64)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return 0, fmt.Errorf("'file' field not found in memory.stat")
 }
 
 func readPSI(path string) (*PSI, error) {

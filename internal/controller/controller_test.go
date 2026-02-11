@@ -15,18 +15,24 @@ import (
 )
 
 // Helper to create a fake cgroup with metrics
-func createFakeCgroup(t *testing.T, cgroupRoot, cgroupPath string, swapBytes, memoryMax int64) {
+func createFakeCgroup(t *testing.T, cgroupRoot, cgroupPath string, swapBytes, memoryCurrent, memoryMax, fileCache int64) {
 	t.Helper()
 	fullPath := filepath.Join(cgroupRoot, cgroupPath)
 	if err := os.MkdirAll(fullPath, 0755); err != nil {
 		t.Fatalf("Failed to create cgroup dir: %v", err)
 	}
 
+	anon := memoryCurrent - fileCache
+	if anon < 0 {
+		anon = 0
+	}
+
 	files := map[string]string{
 		"memory.swap.current": fmt.Sprintf("%d", swapBytes),
 		"memory.swap.max":     "max", // unlimited swap
-		"memory.current":      "268435456",
+		"memory.current":      fmt.Sprintf("%d", memoryCurrent),
 		"memory.max":          fmt.Sprintf("%d", memoryMax),
+		"memory.stat":         fmt.Sprintf("anon %d\nfile %d\nkernel_stack 16384\n", anon, fileCache),
 		"memory.pressure": `some avg10=1.00 avg60=1.00 avg300=1.00 total=1000
 full avg10=1.00 avg60=1.00 avg300=1.00 total=1000`,
 	}
@@ -165,17 +171,20 @@ func TestScanCgroupsForSwap_QoSFiltering(t *testing.T) {
 	guaranteedPodUID := "bbbb1111_2222_3333_4444_555566667777"
 	besteffortPodUID := "cccc1111_2222_3333_4444_555566667777"
 
-	// Burstable - should be included
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+burstablePodUID+".slice/cri-containerd-abc.scope", 100<<20, 512<<20)
+	// Burstable - should be included (memory at limit, has swap, no file cache)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+burstablePodUID+".slice/cri-containerd-abc.scope", 100<<20, 510<<20, 512<<20, 0)
 	// Guaranteed - should be filtered out (guaranteed pods don't use swap in LimitedSwap)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-pod"+guaranteedPodUID+".slice/cri-containerd-def.scope", 100<<20, 512<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-pod"+guaranteedPodUID+".slice/cri-containerd-def.scope", 100<<20, 510<<20, 512<<20, 0)
 	// BestEffort - should be filtered out (besteffort pods don't use swap in LimitedSwap)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod"+besteffortPodUID+".slice/cri-containerd-ghi.scope", 100<<20, 512<<20)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod"+besteffortPodUID+".slice/cri-containerd-ghi.scope", 100<<20, 510<<20, 512<<20, 0)
 
 	scanner := cgroup.NewScanner(tmpDir)
 	c := &Controller{
 		config: Config{
-			CgroupScanner: scanner,
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
 		},
 	}
 
@@ -206,15 +215,18 @@ func TestScanCgroupsForSwap_SwapZeroFiltering(t *testing.T) {
 	withSwapUID := "aaaa1111_2222_3333_4444_555566667777"
 	noSwapUID := "bbbb1111_2222_3333_4444_555566667777"
 
-	// Pod with swap
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+withSwapUID+".slice/cri-containerd-abc.scope", 100<<20, 512<<20)
-	// Pod without swap (swap=0)
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+noSwapUID+".slice/cri-containerd-def.scope", 0, 512<<20)
+	// Pod with swap (memory at limit, has swap, no file cache)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+withSwapUID+".slice/cri-containerd-abc.scope", 100<<20, 510<<20, 512<<20, 0)
+	// Pod without swap (swap=0) - fails condition B
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+noSwapUID+".slice/cri-containerd-def.scope", 0, 510<<20, 512<<20, 0)
 
 	scanner := cgroup.NewScanner(tmpDir)
 	c := &Controller{
 		config: Config{
-			CgroupScanner: scanner,
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
 		},
 	}
 
@@ -240,13 +252,16 @@ func TestScanCgroupsForSwap_SwapPercentCalculation(t *testing.T) {
 
 	podUID := "aaaa1111_2222_3333_4444_555566667777"
 
-	// Create cgroup: 50MB swap, 512MB memory limit = ~9.77% swap usage
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-abc.scope", 50<<20, 512<<20)
+	// Create cgroup: 50MB swap, 512MB memory limit, memory at limit, no file cache
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-abc.scope", 50<<20, 510<<20, 512<<20, 0)
 
 	scanner := cgroup.NewScanner(tmpDir)
 	c := &Controller{
 		config: Config{
-			CgroupScanner: scanner,
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
 		},
 	}
 
@@ -272,15 +287,18 @@ func TestScanCgroupsForSwap_MultipleContainersInPod(t *testing.T) {
 	podUID := "aaaa1111_2222_3333_4444_555566667777"
 
 	// Two containers in the same pod (same pod UID, different container IDs)
-	// Container 1: 50MB swap / 256MB limit = ~19.5%
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-abc.scope", 50<<20, 256<<20)
-	// Container 2: 100MB swap / 512MB limit = ~19.5%
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-def.scope", 100<<20, 512<<20)
+	// Container 1: 50MB swap / 256MB limit = ~19.5%, memory at limit, no file cache
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-abc.scope", 50<<20, 254<<20, 256<<20, 0)
+	// Container 2: 100MB swap / 512MB limit = ~19.5%, memory at limit, no file cache
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-def.scope", 100<<20, 510<<20, 512<<20, 0)
 
 	scanner := cgroup.NewScanner(tmpDir)
 	c := &Controller{
 		config: Config{
-			CgroupScanner: scanner,
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
 		},
 	}
 
@@ -306,13 +324,16 @@ func TestScanCgroupsForSwap_CRIORuntime(t *testing.T) {
 
 	podUID := "aaaa1111_2222_3333_4444_555566667777"
 
-	// Create cgroup with CRI-O format
-	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/crio-abc.scope", 100<<20, 512<<20)
+	// Create cgroup with CRI-O format (memory at limit, has swap, no file cache)
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/crio-abc.scope", 100<<20, 510<<20, 512<<20, 0)
 
 	scanner := cgroup.NewScanner(tmpDir)
 	c := &Controller{
 		config: Config{
-			CgroupScanner: scanner,
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
 		},
 	}
 
@@ -329,6 +350,101 @@ func TestScanCgroupsForSwap_CRIORuntime(t *testing.T) {
 	expectedUID := "aaaa1111-2222-3333-4444-555566667777"
 	if candidates[0].UID != expectedUID {
 		t.Errorf("candidate UID = %s, want %s", candidates[0].UID, expectedUID)
+	}
+}
+
+func TestScanCgroupsForSwap_MemoryBelowThreshold(t *testing.T) {
+	tmpDir := t.TempDir()
+	podUID := "aaaa1111_2222_3333_4444_555566667777"
+
+	// Memory at 50% of limit (below 99% threshold) - should NOT be a candidate
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-abc.scope",
+		50<<20, 256<<20, 512<<20, 0)
+
+	scanner := cgroup.NewScanner(tmpDir)
+	c := &Controller{
+		config: Config{
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
+		},
+	}
+
+	candidates, err := c.scanCgroupsForSwap()
+	if err != nil {
+		t.Fatalf("scanCgroupsForSwap() error = %v", err)
+	}
+
+	if len(candidates) != 0 {
+		t.Errorf("scanCgroupsForSwap() returned %d candidates, want 0 (memory below threshold)", len(candidates))
+	}
+}
+
+func TestScanCgroupsForSwap_FileCacheAboveThreshold(t *testing.T) {
+	tmpDir := t.TempDir()
+	podUID := "aaaa1111_2222_3333_4444_555566667777"
+
+	// Memory at limit, has swap, but file cache is 25% (above 1% threshold) - should NOT be a candidate
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-abc.scope",
+		50<<20, 510<<20, 512<<20, 128<<20)
+
+	scanner := cgroup.NewScanner(tmpDir)
+	c := &Controller{
+		config: Config{
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
+		},
+	}
+
+	candidates, err := c.scanCgroupsForSwap()
+	if err != nil {
+		t.Fatalf("scanCgroupsForSwap() error = %v", err)
+	}
+
+	if len(candidates) != 0 {
+		t.Errorf("scanCgroupsForSwap() returned %d candidates, want 0 (file cache above threshold)", len(candidates))
+	}
+}
+
+func TestScanCgroupsForSwap_AllConditionsMet(t *testing.T) {
+	tmpDir := t.TempDir()
+	podUID := "aaaa1111_2222_3333_4444_555566667777"
+
+	// Memory at 99.6% of limit, has swap, file cache at 0% - should be a candidate
+	createFakeCgroup(t, tmpDir, "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"+podUID+".slice/cri-containerd-abc.scope",
+		50<<20, 510<<20, 512<<20, 0)
+
+	scanner := cgroup.NewScanner(tmpDir)
+	c := &Controller{
+		config: Config{
+			CgroupScanner:             scanner,
+			MemoryThresholdPercent:    99,
+			SwapThresholdPercent:      0,
+			FileCacheThresholdPercent: 1,
+		},
+	}
+
+	candidates, err := c.scanCgroupsForSwap()
+	if err != nil {
+		t.Fatalf("scanCgroupsForSwap() error = %v", err)
+	}
+
+	if len(candidates) != 1 {
+		t.Fatalf("scanCgroupsForSwap() returned %d candidates, want 1", len(candidates))
+	}
+
+	cand := candidates[0]
+	if cand.MemoryPercent < 99 {
+		t.Errorf("MemoryPercent = %.2f, want > 99", cand.MemoryPercent)
+	}
+	if cand.SwapPercent <= 0 {
+		t.Errorf("SwapPercent = %.2f, want > 0", cand.SwapPercent)
+	}
+	if cand.FileCachePercent >= 1 {
+		t.Errorf("FileCachePercent = %.2f, want < 1", cand.FileCachePercent)
 	}
 }
 

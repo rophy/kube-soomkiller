@@ -21,8 +21,10 @@ type Metrics struct {
 	LastKillTimestamp prometheus.Gauge
 
 	// Configuration metrics
-	ConfigSwapThresholdPercent prometheus.Gauge
-	ConfigDryRun               prometheus.Gauge
+	ConfigMemoryThresholdPercent    prometheus.Gauge
+	ConfigSwapThresholdPercent      prometheus.Gauge
+	ConfigFileCacheThresholdPercent prometheus.Gauge
+	ConfigDryRun                    prometheus.Gauge
 }
 
 // NewMetrics creates metrics with the node label
@@ -43,10 +45,22 @@ func NewMetrics(nodeName string) *Metrics {
 			Help:        "Unix timestamp of the last pod kill",
 			ConstLabels: nodeLabel,
 		}),
+		ConfigMemoryThresholdPercent: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "config_memory_threshold_percent",
+			Help:        "Configured memory threshold as percentage of memory.max",
+			ConstLabels: nodeLabel,
+		}),
 		ConfigSwapThresholdPercent: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace:   namespace,
 			Name:        "config_swap_threshold_percent",
-			Help:        "Configured swap threshold as percentage of memory limit",
+			Help:        "Configured swap threshold as percentage of memory.max",
+			ConstLabels: nodeLabel,
+		}),
+		ConfigFileCacheThresholdPercent: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "config_file_cache_threshold_percent",
+			Help:        "Configured file cache threshold as percentage of memory.max",
 			ConstLabels: nodeLabel,
 		}),
 		ConfigDryRun: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -63,7 +77,9 @@ func (m *Metrics) Register() {
 	prometheus.MustRegister(
 		m.PodsKilledTotal,
 		m.LastKillTimestamp,
+		m.ConfigMemoryThresholdPercent,
 		m.ConfigSwapThresholdPercent,
+		m.ConfigFileCacheThresholdPercent,
 		m.ConfigDryRun,
 	)
 }
@@ -133,6 +149,7 @@ type ContainerMetricsCollector struct {
 	swapMaxDesc       *prometheus.Desc
 	memoryCurrentDesc *prometheus.Desc
 	memoryMaxDesc     *prometheus.Desc
+	fileCacheBytesDesc *prometheus.Desc
 }
 
 // NewContainerMetricsCollector creates a collector for per-container metrics
@@ -164,6 +181,11 @@ func NewContainerMetricsCollector(scanner *cgroup.Scanner, podLookup PodLookup, 
 			"Memory limit in bytes per container",
 			labels, nodeLabel,
 		),
+		fileCacheBytesDesc: prometheus.NewDesc(
+			namespace+"_container_file_cache_bytes",
+			"File cache (page cache) in bytes per container",
+			labels, nodeLabel,
+		),
 	}
 }
 
@@ -173,6 +195,7 @@ func (c *ContainerMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.swapMaxDesc
 	ch <- c.memoryCurrentDesc
 	ch <- c.memoryMaxDesc
+	ch <- c.fileCacheBytesDesc
 }
 
 // Collect implements prometheus.Collector - scans cgroups on each scrape
@@ -224,6 +247,8 @@ func (c *ContainerMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 			float64(metrics.MemoryCurrent), labels...)
 		ch <- prometheus.MustNewConstMetric(c.memoryMaxDesc, prometheus.GaugeValue,
 			float64(metrics.MemoryMax), labels...)
+		ch <- prometheus.MustNewConstMetric(c.fileCacheBytesDesc, prometheus.GaugeValue,
+			float64(metrics.FileCache), labels...)
 	}
 }
 

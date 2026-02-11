@@ -16,15 +16,17 @@ import (
 
 // Config holds controller configuration
 type Config struct {
-	NodeName             string
-	PollInterval         time.Duration
-	SwapThresholdPercent float64 // Kill pods with swap > this % of memory.max
-	DryRun               bool
-	ProtectedNamespaces  []string // namespaces to never kill pods from
-	K8sClient            kubernetes.Interface
-	CgroupScanner        *cgroup.Scanner
-	EventRecorder        record.EventRecorder // optional, for emitting Kubernetes events
-	PodInformer          *PodInformer         // node-scoped pod cache
+	NodeName                  string
+	PollInterval              time.Duration
+	MemoryThresholdPercent    float64 // Kill pods with memory.current > this % of memory.max
+	SwapThresholdPercent      float64 // Kill pods with swap.current > this % of memory.max
+	FileCacheThresholdPercent float64 // Kill pods with file cache < this % of memory.max
+	DryRun                    bool
+	ProtectedNamespaces       []string // namespaces to never kill pods from
+	K8sClient                 kubernetes.Interface
+	CgroupScanner             *cgroup.Scanner
+	EventRecorder             record.EventRecorder // optional, for emitting Kubernetes events
+	PodInformer               *PodInformer         // node-scoped pod cache
 }
 
 // Controller monitors swap pressure and terminates pods when necessary
@@ -37,10 +39,12 @@ type Controller struct {
 
 // PodCandidate represents a pod that may be terminated
 type PodCandidate struct {
-	UID         string  // Pod UID from cgroup path
-	Namespace   string  // Populated from informer cache
-	Name        string  // Populated from informer cache
-	SwapPercent float64 // Max swap percentage across all containers
+	UID              string  // Pod UID from cgroup path
+	Namespace        string  // Populated from informer cache
+	Name             string  // Populated from informer cache
+	MemoryPercent    float64 // memory.current / memory.max * 100
+	SwapPercent      float64 // swap.current / memory.max * 100
+	FileCachePercent float64 // file_cache / memory.max * 100
 }
 
 // New creates a new controller
@@ -60,7 +64,10 @@ func New(config Config) *Controller {
 // Run starts the controller main loop
 func (c *Controller) Run(ctx context.Context) error {
 	klog.InfoS("Controller started", "pollInterval", c.config.PollInterval)
-	klog.InfoS("Configured swap threshold", "thresholdPercent", c.config.SwapThresholdPercent)
+	klog.InfoS("Configured thresholds",
+		"memoryThresholdPercent", c.config.MemoryThresholdPercent,
+		"swapThresholdPercent", c.config.SwapThresholdPercent,
+		"fileCacheThresholdPercent", c.config.FileCacheThresholdPercent)
 	if len(c.config.ProtectedNamespaces) > 0 {
 		klog.InfoS("Protected namespaces configured", "namespaces", c.config.ProtectedNamespaces)
 	}
@@ -108,40 +115,23 @@ func (c *Controller) reconcile(ctx context.Context) error {
 }
 
 func (c *Controller) findAndKillOverThreshold(ctx context.Context) error {
-	// Phase 1: Scan cgroups for swap usage (NO API CALL)
+	// Phase 1: Scan cgroups for kill candidates (NO API CALL)
+	// Candidates already satisfy all three conditions (memory, swap, file cache)
 	candidates, err := c.scanCgroupsForSwap()
 	if err != nil {
 		return err
 	}
 
 	if len(candidates) == 0 {
-		klog.V(3).InfoS("No pods using swap")
-		return nil
-	}
-
-	// Filter to only pods over threshold
-	var overThreshold []PodCandidate
-	for _, cand := range candidates {
-		if cand.SwapPercent > c.config.SwapThresholdPercent {
-			overThreshold = append(overThreshold, cand)
-		}
-	}
-
-	if len(overThreshold) == 0 {
-		// Log details of candidates at V(3) for debugging
-		for _, cand := range candidates {
-			klog.V(3).InfoS("Candidate below threshold", "uid", cand.UID, "swapPercent", cand.SwapPercent, "thresholdPercent", c.config.SwapThresholdPercent)
-		}
-		klog.V(3).InfoS("Found pods using swap, none over threshold", "count", len(candidates))
+		klog.V(3).InfoS("No pods meet kill criteria")
 		return nil
 	}
 
 	// Phase 2: Resolve pod names from informer cache (no API call)
-	klog.V(3).InfoS("Found pods over threshold", "usingSwap", len(candidates), "overThreshold", len(overThreshold))
+	klog.V(3).InfoS("Found kill candidates", "count", len(candidates))
 
-	// Resolve and filter candidates using informer cache
 	var resolved []PodCandidate
-	for _, cand := range overThreshold {
+	for _, cand := range candidates {
 		pod := c.config.PodInformer.GetPodByUID(cand.UID)
 		if pod == nil {
 			klog.V(3).InfoS("Pod not found in cache", "uid", cand.UID)
@@ -173,7 +163,8 @@ func (c *Controller) findAndKillOverThreshold(ctx context.Context) error {
 	// Log all resolved candidates
 	klog.V(2).InfoS("Found pods over threshold", "count", len(resolved))
 	for _, cand := range resolved {
-		klog.V(2).InfoS("Pod over threshold", "pod", klog.KRef(cand.Namespace, cand.Name), "swapPercent", cand.SwapPercent)
+		klog.V(2).InfoS("Pod over threshold", "pod", klog.KRef(cand.Namespace, cand.Name),
+			"memoryPercent", cand.MemoryPercent, "swapPercent", cand.SwapPercent, "fileCachePercent", cand.FileCachePercent)
 	}
 
 	// Kill pods over threshold (sorted by swap percent descending)
@@ -191,14 +182,17 @@ func (c *Controller) findAndKillOverThreshold(ctx context.Context) error {
 	}
 
 	if killed > 0 {
-		klog.InfoS("Deleted pods over swap threshold", "count", killed)
+		klog.InfoS("Deleted pods over threshold", "count", killed)
 	}
 
 	return nil
 }
 
-// scanCgroupsForSwap scans cgroups for pods using swap without calling the API.
-// It filters by QoS class (burstable only) and returns candidates with swap usage.
+// scanCgroupsForSwap scans cgroups for pods that meet all kill criteria.
+// A container is a kill candidate when ALL conditions are true:
+//   - memory.current / memory.max > MemoryThresholdPercent
+//   - swap.current / memory.max > SwapThresholdPercent
+//   - file_cache / memory.max < FileCacheThresholdPercent
 func (c *Controller) scanCgroupsForSwap() ([]PodCandidate, error) {
 	// Find all container cgroups via filesystem walk
 	cgroupsResult, err := c.config.CgroupScanner.FindPodCgroups()
@@ -231,27 +225,37 @@ func (c *Controller) scanCgroupsForSwap() ([]PodCandidate, error) {
 			continue
 		}
 
-		// Skip if not using swap
-		if containerMetrics.SwapCurrent == 0 {
+		// Calculate percentages (all relative to memory.max)
+		if containerMetrics.MemoryMax <= 0 {
+			continue
+		}
+		memoryMax := float64(containerMetrics.MemoryMax)
+		memoryPercent := float64(containerMetrics.MemoryCurrent) / memoryMax * 100
+		swapPercent := float64(containerMetrics.SwapCurrent) / memoryMax * 100
+		fileCachePercent := float64(containerMetrics.FileCache) / memoryMax * 100
+
+		// All three conditions must be true for a kill candidate
+		isCandidate := memoryPercent > c.config.MemoryThresholdPercent &&
+			swapPercent > c.config.SwapThresholdPercent &&
+			fileCachePercent < c.config.FileCacheThresholdPercent
+
+		if !isCandidate {
 			continue
 		}
 
-		// Calculate swap percentage for THIS container
-		var swapPercent float64
-		if containerMetrics.MemoryMax > 0 {
-			swapPercent = float64(containerMetrics.SwapCurrent) / float64(containerMetrics.MemoryMax) * 100
-		}
-
 		if existing, ok := processedPods[uid]; ok {
-			// Pod already seen - take max swap percentage
-			// If ANY container exceeds threshold, the pod should be killed
+			// Pod already seen - keep the worst-case metrics (highest swap)
 			if swapPercent > existing.SwapPercent {
+				existing.MemoryPercent = memoryPercent
 				existing.SwapPercent = swapPercent
+				existing.FileCachePercent = fileCachePercent
 			}
 		} else {
 			processedPods[uid] = &PodCandidate{
-				UID:         uid,
-				SwapPercent: swapPercent,
+				UID:              uid,
+				MemoryPercent:    memoryPercent,
+				SwapPercent:      swapPercent,
+				FileCachePercent: fileCachePercent,
 			}
 		}
 	}
@@ -267,7 +271,8 @@ func (c *Controller) scanCgroupsForSwap() ([]PodCandidate, error) {
 
 func (c *Controller) terminatePod(ctx context.Context, cand PodCandidate) error {
 	if c.config.DryRun {
-		klog.InfoS("Would delete pod (dry-run)", "pod", klog.KRef(cand.Namespace, cand.Name), "swapPercent", cand.SwapPercent)
+		klog.InfoS("Would delete pod (dry-run)", "pod", klog.KRef(cand.Namespace, cand.Name),
+			"memoryPercent", cand.MemoryPercent, "swapPercent", cand.SwapPercent, "fileCachePercent", cand.FileCachePercent)
 		return nil
 	}
 
@@ -277,8 +282,8 @@ func (c *Controller) terminatePod(ctx context.Context, cand PodCandidate) error 
 		pod := c.config.PodInformer.GetPodByUID(cand.UID)
 		if pod != nil {
 			c.config.EventRecorder.Eventf(pod, corev1.EventTypeWarning, "Soomkilled",
-				"Pod %s deleted by kube-soomkiller on node %s: swap usage %.1f%%",
-				cand.Name, c.config.NodeName, cand.SwapPercent)
+				"Pod %s deleted by kube-soomkiller on node %s: memory %.1f%%, swap %.1f%%, file cache %.1f%%",
+				cand.Name, c.config.NodeName, cand.MemoryPercent, cand.SwapPercent, cand.FileCachePercent)
 		} else {
 			klog.V(3).InfoS("Could not get pod from cache for event", "pod", klog.KRef(cand.Namespace, cand.Name))
 		}
@@ -289,6 +294,8 @@ func (c *Controller) terminatePod(ctx context.Context, cand PodCandidate) error 
 		return fmt.Errorf("failed to delete pod %s/%s: %w", cand.Namespace, cand.Name, err)
 	}
 
-	klog.InfoS("Deleted pod", "pod", klog.KRef(cand.Namespace, cand.Name), "swapPercent", cand.SwapPercent, "reason", "swap threshold exceeded")
+	klog.InfoS("Deleted pod", "pod", klog.KRef(cand.Namespace, cand.Name),
+		"memoryPercent", cand.MemoryPercent, "swapPercent", cand.SwapPercent, "fileCachePercent", cand.FileCachePercent,
+		"reason", "soomkill thresholds exceeded")
 	return nil
 }

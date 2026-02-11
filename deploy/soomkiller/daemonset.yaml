@@ -28,7 +28,9 @@ spec:
         - name: kube-soomkiller
           image: rophy/kube-soomkiller
           args:
-            - --swap-threshold-percent=1
+            - --memory-threshold-percent=99
+            - --swap-threshold-percent=0
+            - --file-cache-threshold-percent=1
             - --poll-interval=1s
             - -v=2
           env:

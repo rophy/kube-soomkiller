@@ -22,6 +22,7 @@ func TestGetContainerMetrics(t *testing.T) {
 		"memory.swap.max":     "1073741824", // 1GB
 		"memory.current":      "268435456",  // 256MB
 		"memory.max":          "536870912",  // 512MB
+		"memory.stat":         "anon 143654912\nfile 124600320\nkernel_stack 16384\nshmem 0\n",
 		"memory.pressure": `some avg10=5.50 avg60=2.30 avg300=1.10 total=123456
 full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 	}
@@ -56,6 +57,11 @@ full avg10=3.25 avg60=1.50 avg300=0.80 total=654321`,
 		t.Errorf("MemoryMax = %d, want 536870912", metrics.MemoryMax)
 	}
 
+	// Verify file cache
+	if metrics.FileCache != 124600320 {
+		t.Errorf("FileCache = %d, want 124600320", metrics.FileCache)
+	}
+
 	// Verify PSI
 	if metrics.PSI.SomeAvg10 != 5.50 {
 		t.Errorf("PSI.SomeAvg10 = %f, want 5.50", metrics.PSI.SomeAvg10)
@@ -82,6 +88,7 @@ func TestGetContainerMetrics_ZeroSwap(t *testing.T) {
 		"memory.swap.max":     "536870912", // 512MB
 		"memory.current":      "134217728",
 		"memory.max":          "268435456", // 256MB
+		"memory.stat":         "anon 134213632\nfile 4096\n",
 		"memory.pressure": `some avg10=0.00 avg60=0.00 avg300=0.00 total=0
 full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 	}
@@ -117,6 +124,7 @@ func TestGetContainerMetrics_UnlimitedMemory(t *testing.T) {
 		"memory.swap.max":     "max", // unlimited
 		"memory.current":      "134217728",
 		"memory.max":          "max", // unlimited
+		"memory.stat":         "anon 134213632\nfile 4096\n",
 		"memory.pressure": `some avg10=0.00 avg60=0.00 avg300=0.00 total=0
 full avg10=0.00 avg60=0.00 avg300=0.00 total=0`,
 	}

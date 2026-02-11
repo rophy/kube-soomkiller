@@ -41,14 +41,21 @@ Edit `deploy/daemonset.yaml` to adjust parameters:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--swap-threshold-percent` | 1 | Kill pods with swap usage > this % of memory limit |
-| `--poll-interval` | 1s | How often to sample /proc/vmstat (minimum 1s) |
+| `--memory-threshold-percent` | 99 | Kill pods with memory.current > this % of memory.max |
+| `--swap-threshold-percent` | 0 | Kill pods with swap.current > this % of memory.max |
+| `--file-cache-threshold-percent` | 1 | Kill pods with file cache < this % of memory.max |
+| `--poll-interval` | 1s | How often to scan cgroups (minimum 1s) |
 | `--dry-run` | true | Log actions without executing (also via `DRY_RUN` env var) |
 | `--cgroup-root` | /sys/fs/cgroup | Path to cgroup v2 root |
 | `--metrics-addr` | :8080 | Address to serve Prometheus metrics |
 | `--protected-namespaces` | kube-system | Comma-separated list of namespaces to never kill pods from |
 
-**How it works:** Every poll interval, the controller scans all pod cgroups on the node. Pods with `memory.swap.current / memory.max > swap-threshold-percent` are terminated. The threshold is expressed as a percentage of the pod's memory limit.
+**How it works:** Every poll interval, the controller scans all burstable pod cgroups on the node. A pod is terminated when ALL three conditions are true:
+- `memory.current / memory.max > memory-threshold-percent` (memory nearly full)
+- `swap.current / memory.max > swap-threshold-percent` (swap in use)
+- `file_cache / memory.max < file-cache-threshold-percent` (file cache exhausted)
+
+All thresholds use `memory.max` as denominator for consistency. The file cache condition prevents false kills when the kernel is swapping anonymous pages while file cache is still reclaimable.
 
 ### Prometheus Metrics
 
@@ -64,7 +71,10 @@ The controller exposes metrics on `:8080/metrics`:
 | `soomkiller_container_swap_max_bytes` | Gauge | node, namespace, pod, container | Swap limit in bytes |
 | `soomkiller_container_memory_current_bytes` | Gauge | node, namespace, pod, container | Memory usage in bytes |
 | `soomkiller_container_memory_max_bytes` | Gauge | node, namespace, pod, container | Memory limit in bytes |
+| `soomkiller_container_file_cache_bytes` | Gauge | node, namespace, pod, container | File cache (page cache) in bytes |
+| `soomkiller_config_memory_threshold_percent` | Gauge | node | Configured memory threshold % |
 | `soomkiller_config_swap_threshold_percent` | Gauge | node | Configured swap threshold % |
+| `soomkiller_config_file_cache_threshold_percent` | Gauge | node | Configured file cache threshold % |
 | `soomkiller_config_dry_run` | Gauge | node | 1 if dry-run mode, 0 otherwise |
 
 **Note:** Container metrics are only emitted for burstable pods on the node. You can calculate swap percentage in PromQL:
@@ -274,12 +284,13 @@ Proactively terminate pods under memory pressure before the system becomes unres
 │          ▼                                                  │
 │   ┌─────────────────┐      ┌─────────────────────────────┐  │
 │   │   Controller    │      │  Per-pod metrics (cgroup)   │  │
-│   │   (DaemonSet)   │─────▶│  - memory.swap.current      │  │
-│   └────────┬────────┘      │  - memory.max               │  │
+│   │   (DaemonSet)   │─────▶│  - memory.current / .max    │  │
+│   └────────┬────────┘      │  - swap.current             │  │
+│            │               │  - memory.stat (file cache)  │  │
 │            │               └─────────────────────────────┘  │
 │            │                                                │
-│            │ Kill all pods where:                           │
-│            │   swap.current / memory.max > threshold        │
+│            │ Kill when ALL true:                            │
+│            │   memory > A% AND swap > B% AND cache < C%    │
 │            ▼                                                │
 │   ┌─────────────────┐                                       │
 │   │ kubectl delete  │──▶ SIGTERM ──▶ Grace Period ──▶ Clean │
@@ -295,34 +306,35 @@ Proactively terminate pods under memory pressure before the system becomes unres
 
 Every poll interval (default 1s), the controller scans all pod cgroups on the node. This is a lightweight filesystem operation with no Kubernetes API calls. The scan reads:
 
-- `memory.swap.current` - current swap usage in bytes
+- `memory.current` - current memory usage in bytes (includes anon + file cache)
 - `memory.max` - memory limit in bytes
+- `memory.swap.current` - current swap usage in bytes
+- `memory.stat` - detailed memory stats (parsed for `file` field = file cache bytes)
 
 Only burstable pods are scanned, since guaranteed pods don't use swap and besteffort pods have no memory limits.
 
 ### 2. Threshold Check
 
-For each pod, the controller calculates:
+For each container, the controller calculates three percentages (all relative to `memory.max`):
 ```
-swap_percent = memory.swap.current / memory.max * 100
+memory_percent    = memory.current / memory.max * 100
+swap_percent      = swap.current   / memory.max * 100
+file_cache_percent = file_cache    / memory.max * 100
 ```
 
-Pods with `swap_percent > swap-threshold-percent` are candidates for termination.
+A container is a kill candidate when ALL three conditions are true:
+- `memory_percent > memory-threshold-percent` (default 99%)
+- `swap_percent > swap-threshold-percent` (default 0%)
+- `file_cache_percent < file-cache-threshold-percent` (default 1%)
 
 ### 3. Pod Selection and Termination
 
-```
-for each pod:
-  swap_percent = memory.swap.current / memory.max * 100
-  if swap_percent > swap_threshold_percent:
-    delete pod
-```
-
 Kill all pods where:
-1. Swap usage exceeds the configured threshold (% of memory limit)
+1. At least one container meets all three conditions above
 2. Pod is not in a protected namespace
+3. Pod is not already terminating
 
-**Key insight:** Any swap usage means the pod exceeded its memory limit and would have been OOMKilled without swap. The threshold provides a buffer for edge cases (e.g., 1 byte swap).
+**Key insight:** The file cache condition prevents false kills. With `vm.swappiness > 0`, the kernel may swap anonymous pages while file cache is still reclaimable. Checking that file cache is nearly zero ensures the pod is truly under memory pressure, not just experiencing normal swap balancing.
 
 ### 4. Graceful Termination
 
@@ -430,15 +442,17 @@ swapon /dev/sdb
 
 This isolates swap I/O from the root filesystem, preventing swap activity from starving kubelet, etcd, and other control plane components.
 
-### Tuning the Threshold
+### Tuning the Thresholds
 
-| Scenario | swap-threshold-percent | Description |
-|----------|------------------------|-------------|
-| Aggressive | 0.1% | Kill pods at first sign of swap |
-| Balanced | 1% (default) | Allow minor swap before killing |
-| Conservative | 5% | Allow more swap headroom |
+The three thresholds work together as an AND gate. All must be satisfied to trigger a kill:
 
-Start with the default (1%) and adjust based on your workload characteristics. Lower values are more aggressive but may kill pods prematurely for brief memory spikes.
+| Flag | Default | Raise to... | Effect |
+|------|---------|-------------|--------|
+| `--memory-threshold-percent` | 99 | 95 | Kill earlier, before memory is completely full |
+| `--swap-threshold-percent` | 0 | 5 | Tolerate small amounts of swap before killing |
+| `--file-cache-threshold-percent` | 1 | 5 | Require more file cache to be evicted before killing |
+
+Start with the defaults and adjust based on your workload. The defaults kill when memory is nearly full, any swap is in use, and file cache is nearly zero - indicating genuine memory pressure rather than normal kernel swap balancing.
 
 ## Limitations
 

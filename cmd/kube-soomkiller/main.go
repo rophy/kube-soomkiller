@@ -29,22 +29,26 @@ var version = "dev"
 
 func main() {
 	var (
-		kubeconfig            string
-		nodeName              string
-		pollInterval          time.Duration
-		swapThresholdPercent  float64
-		cgroupRoot            string
-		dryRun                bool
-		metricsAddr           string
-		protectedNamespaces   string
-		showVersion           bool
+		kubeconfig                string
+		nodeName                  string
+		pollInterval              time.Duration
+		memoryThresholdPercent    float64
+		swapThresholdPercent      float64
+		fileCacheThresholdPercent float64
+		cgroupRoot                string
+		dryRun                    bool
+		metricsAddr               string
+		protectedNamespaces       string
+		showVersion               bool
 	)
 
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not set)")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node to monitor")
-	flag.DurationVar(&pollInterval, "poll-interval", 1*time.Second, "How often to sample /proc/vmstat (minimum 1s)")
-	flag.Float64Var(&swapThresholdPercent, "swap-threshold-percent", 1.0, "Kill pods with swap usage > this % of memory limit")
+	flag.DurationVar(&pollInterval, "poll-interval", 1*time.Second, "How often to scan cgroups (minimum 1s)")
+	flag.Float64Var(&memoryThresholdPercent, "memory-threshold-percent", 99.0, "Kill pods with memory usage > this % of memory.max")
+	flag.Float64Var(&swapThresholdPercent, "swap-threshold-percent", 0.0, "Kill pods with swap usage > this % of memory.max")
+	flag.Float64Var(&fileCacheThresholdPercent, "file-cache-threshold-percent", 1.0, "Kill pods with file cache < this % of memory.max")
 	flag.StringVar(&cgroupRoot, "cgroup-root", "/sys/fs/cgroup", "Path to cgroup v2 root")
 	flag.BoolVar(&dryRun, "dry-run", getEnvBool("DRY_RUN", true), "Log actions without executing")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "Address to serve Prometheus metrics on")
@@ -67,12 +71,22 @@ func main() {
 	if pollInterval < time.Second {
 		klog.Fatalf("--poll-interval must be at least 1s, got %s", pollInterval)
 	}
+	if memoryThresholdPercent < 0 || memoryThresholdPercent > 100 {
+		klog.Fatalf("--memory-threshold-percent must be between 0 and 100, got %f", memoryThresholdPercent)
+	}
 	if swapThresholdPercent < 0 {
 		klog.Fatalf("--swap-threshold-percent must be >= 0, got %f", swapThresholdPercent)
 	}
+	if fileCacheThresholdPercent < 0 || fileCacheThresholdPercent > 100 {
+		klog.Fatalf("--file-cache-threshold-percent must be between 0 and 100, got %f", fileCacheThresholdPercent)
+	}
 
 	klog.InfoS("Starting kube-soomkiller", "node", nodeName, "version", version)
-	klog.InfoS("Configuration loaded", "pollInterval", pollInterval, "swapThresholdPercent", swapThresholdPercent, "dryRun", dryRun)
+	klog.InfoS("Configuration loaded", "pollInterval", pollInterval,
+		"memoryThresholdPercent", memoryThresholdPercent,
+		"swapThresholdPercent", swapThresholdPercent,
+		"fileCacheThresholdPercent", fileCacheThresholdPercent,
+		"dryRun", dryRun)
 
 	// Create cgroup scanner
 	cgroupScanner := cgroup.NewScanner(cgroupRoot)
@@ -89,7 +103,9 @@ func main() {
 	metrics.RegisterSwapIOCollector(cgroupScanner, nodeName)
 
 	// Set config metrics
+	m.ConfigMemoryThresholdPercent.Set(memoryThresholdPercent)
 	m.ConfigSwapThresholdPercent.Set(swapThresholdPercent)
+	m.ConfigFileCacheThresholdPercent.Set(fileCacheThresholdPercent)
 	if dryRun {
 		m.ConfigDryRun.Set(1)
 	} else {
@@ -143,15 +159,17 @@ func main() {
 
 	// Create controller
 	ctrl := controller.New(controller.Config{
-		NodeName:             nodeName,
-		PollInterval:         pollInterval,
-		SwapThresholdPercent: swapThresholdPercent,
-		DryRun:               dryRun,
-		ProtectedNamespaces:  protectedNSList,
-		K8sClient:            k8sClient,
-		CgroupScanner:        cgroupScanner,
-		EventRecorder:        eventRecorder,
-		PodInformer:          podInformer,
+		NodeName:                  nodeName,
+		PollInterval:              pollInterval,
+		MemoryThresholdPercent:    memoryThresholdPercent,
+		SwapThresholdPercent:      swapThresholdPercent,
+		FileCacheThresholdPercent: fileCacheThresholdPercent,
+		DryRun:                    dryRun,
+		ProtectedNamespaces:       protectedNSList,
+		K8sClient:                 k8sClient,
+		CgroupScanner:             cgroupScanner,
+		EventRecorder:             eventRecorder,
+		PodInformer:               podInformer,
 	})
 
 	// Handle shutdown gracefully
