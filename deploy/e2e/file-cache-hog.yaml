@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: file-cache-hog
+  namespace: kube-soomkiller
+  labels:
+    app: file-cache-hog
+spec:
+  backoffLimit: 0  # Don't retry on failure
+  template:
+    metadata:
+      labels:
+        app: file-cache-hog
+    spec:
+      # Run on worker nodes (same as soomkiller)
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
+      containers:
+        - name: file-cache-hog
+          image: polinux/stress
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Phase 1: Create 100MB file and load into page cache
+              dd if=/dev/urandom of=/tmp/bigfile bs=1M count=100
+              cat /tmp/bigfile > /dev/null
+              # Phase 2: Background reader to keep file cache warm
+              while true; do cat /tmp/bigfile > /dev/null; sleep 1; done &
+              # Phase 3: Small delay to let file cache settle
+              sleep 2
+              # Phase 4: Allocate anonymous memory exceeding limit
+              # 512Mi limit = 537MB. With 100MB file cache, 450MB anon
+              # pushes total to ~560MB (23MB over limit).
+              # Even if kernel evicts some file cache during allocation,
+              # 100-23=77MB remains (14% >> 1% threshold).
+              # --vm-hang 300 makes anon "cold" so kernel can swap it.
+              stress --vm 1 --vm-bytes 450M --vm-keep --vm-hang 300
+          resources:
+            requests:
+              memory: 128Mi
+            limits:
+              memory: 512Mi  # Burstable QoS (requests < limits enables swap)
+      restartPolicy: Never

@@ -20,6 +20,7 @@ teardown_file() {
 
     # Cleanup e2e test jobs
     kubectl delete job memory-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+    kubectl delete job file-cache-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
 }
 
 setup() {
@@ -191,4 +192,204 @@ setup() {
         kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled || true
         false
     fi
+}
+
+# Validates the file cache condition prevents false kills
+# Pod has swap usage BUT file cache > 1% of memory.max → should NOT be killed
+# bats test_tags=slow
+@test "pod with file cache and swap is not soomkilled" {
+    # This test needs more time: pod startup + condition verification + survival wait
+    export BATS_TEST_TIMEOUT=180
+    # Delete any existing file-cache-hog job
+    kubectl delete job file-cache-hog -n "$NAMESPACE" --ignore-not-found=true --wait=true 2>/dev/null || true
+
+    # Ensure soomkiller daemonset is fully rolled out and stable.
+    # Skaffold doesn't wait for DaemonSet rollouts, and during rolling updates
+    # the OLD soomkiller pod may still be running in its grace period.
+    # We must wait for it to fully terminate before deploying test workloads.
+    kubectl rollout status ds/kube-soomkiller -n "$NAMESPACE" --timeout=60s
+    # Wait for all soomkiller pods to be Running and Ready (no Terminating pods)
+    attempts=0
+    while [[ $attempts -lt 30 ]]; do
+        local total_pods ready_pods
+        total_pods=$(kubectl get pods -n "$NAMESPACE" -l app=kube-soomkiller --no-headers 2>/dev/null | wc -l)
+        ready_pods=$(kubectl get pods -n "$NAMESPACE" -l app=kube-soomkiller --no-headers 2>/dev/null | grep -c "Running" || true)
+        if [[ "$total_pods" -gt 0 && "$total_pods" -eq "$ready_pods" ]]; then
+            break
+        fi
+        sleep 2
+        attempts=$((attempts + 1))
+    done
+    # Extra settling time for old pods in termination grace period
+    sleep 5
+
+    # Deploy file-cache-hog job (creates file cache + anon memory pressure)
+    kubectl apply -f "$(get_project_root)/deploy/e2e/file-cache-hog.yaml"
+
+    # Wait for pod to start running
+    local pod_name=""
+    local attempts=0
+    while [[ -z "$pod_name" && $attempts -lt 20 ]]; do
+        sleep 1
+        attempts=$((attempts + 1))
+        pod_name=$(kubectl get pods -n "$NAMESPACE" -l job-name=file-cache-hog \
+            --field-selector status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    done
+
+    if [[ -z "$pod_name" ]]; then
+        echo "ERROR: file-cache-hog pod never reached Running state"
+        kubectl get pods -n "$NAMESPACE" -l job-name=file-cache-hog 2>/dev/null || true
+        kubectl delete job file-cache-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        false
+    fi
+    echo "# Pod running: $pod_name"
+
+    # Find which node the pod is on and get soomkiller pod IP on that node
+    local node
+    node=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}')
+    echo "# Pod scheduled on node: $node"
+
+    # Wait for soomkiller pod on the same node to be ready (may restart after previous test)
+    local soomkiller_ip=""
+    attempts=0
+    while [[ -z "$soomkiller_ip" && $attempts -lt 30 ]]; do
+        soomkiller_ip=$(kubectl get pod -n "$NAMESPACE" -l app=kube-soomkiller \
+            --field-selector spec.nodeName="$node" \
+            -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)
+        if [[ -z "$soomkiller_ip" ]]; then
+            sleep 2
+            attempts=$((attempts + 1))
+        fi
+    done
+
+    if [[ -z "$soomkiller_ip" ]]; then
+        echo "ERROR: Could not find soomkiller pod on node $node after 60s"
+        kubectl get pods -n "$NAMESPACE" -l app=kube-soomkiller -o wide 2>/dev/null || true
+        kubectl delete job file-cache-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        false
+    fi
+
+    # Poll metrics until we see both swap > 0 and file cache > 0
+    local swap_detected=false
+    local file_cache_detected=false
+    local swap_bytes=""
+    local cache_bytes=""
+    attempts=0
+
+    while [[ $attempts -lt 30 ]]; do
+        sleep 2
+        attempts=$((attempts + 1))
+
+        # Check pod is still running (not already killed)
+        local phase
+        phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        if [[ "$phase" != "Running" ]]; then
+            echo "ERROR: Pod stopped running (phase=$phase) before conditions were verified"
+            echo "# All events for pod:"
+            kubectl get events -n "$NAMESPACE" --field-selector involvedObject.name="$pod_name" 2>/dev/null || true
+            echo "# Pod describe:"
+            kubectl describe pod "$pod_name" -n "$NAMESPACE" 2>/dev/null | tail -20 || true
+            echo "# Soomkiller logs:"
+            local sk_pod_diag
+            sk_pod_diag=$(kubectl get pod -n "$NAMESPACE" -l app=kube-soomkiller \
+                --field-selector spec.nodeName="$node" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [[ -n "$sk_pod_diag" ]]; then
+                kubectl logs -n "$NAMESPACE" "$sk_pod_diag" --tail=20 2>/dev/null | grep -E "(threshold|Deleted|kill)" || echo "(no kill logs)"
+            fi
+            kubectl delete job file-cache-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+            false
+        fi
+
+        local metrics
+        metrics=$(kubectl exec -n "$NAMESPACE" deploy/curl -- \
+            curl -s --max-time 5 "http://${soomkiller_ip}:8080/metrics" 2>/dev/null || true)
+
+        # Extract swap and file cache bytes for our pod
+        swap_bytes=$(echo "$metrics" | grep "soomkiller_container_swap_bytes" | \
+            grep "$pod_name" | awk '{print $2}' | head -1)
+
+        cache_bytes=$(echo "$metrics" | grep "soomkiller_container_file_cache_bytes" | \
+            grep "$pod_name" | awk '{print $2}' | head -1)
+
+        if [[ -n "$swap_bytes" ]] && awk "BEGIN{exit !($swap_bytes > 0)}"; then
+            swap_detected=true
+        fi
+
+        if [[ -n "$cache_bytes" ]] && awk "BEGIN{exit !($cache_bytes > 0)}"; then
+            file_cache_detected=true
+        fi
+
+        if $swap_detected && $file_cache_detected; then
+            echo "# Conditions verified after $((attempts * 2))s: swap=${swap_bytes} file_cache=${cache_bytes}"
+            break
+        fi
+    done
+
+    if ! $swap_detected || ! $file_cache_detected; then
+        echo "# SKIP: Could not achieve both swap and file cache simultaneously"
+        echo "# swap_detected=$swap_detected (bytes=$swap_bytes)"
+        echo "# file_cache_detected=$file_cache_detected (bytes=$cache_bytes)"
+        echo "# This may happen with vm.swappiness=0 or insufficient memory pressure"
+        kubectl delete job file-cache-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        skip "Could not achieve test conditions (swap + file cache)"
+    fi
+
+    # Both conditions confirmed - poll for 15s to verify pod survives
+    echo "# Monitoring pod for 15s to verify it is not soomkilled..."
+    local survived=true
+    local final_phase="Running"
+    local check=0
+    while [[ $check -lt 8 ]]; do
+        sleep 2
+        check=$((check + 1))
+        final_phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        if [[ "$final_phase" != "Running" ]]; then
+            echo "# Pod stopped at check $check (${check}x2s): phase=$final_phase"
+            echo "# Events for pod:"
+            kubectl get events -n "$NAMESPACE" --field-selector involvedObject.name="$pod_name" 2>/dev/null || true
+            survived=false
+            break
+        fi
+    done
+    echo "# Pod phase after monitoring: $final_phase"
+
+    # Check for Soomkilled event
+    local soomkill_event
+    soomkill_event=$(kubectl get events -n "$NAMESPACE" --field-selector reason=Soomkilled 2>/dev/null | grep "$pod_name" || true)
+
+    # Diagnostic: if pod is gone, check why
+    if [[ -z "$final_phase" || "$final_phase" == "Failed" ]]; then
+        echo "# Diagnostic: pod status"
+        kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null || true
+        kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].lastState}' 2>/dev/null || true
+        echo ""
+        echo "# Diagnostic: job status"
+        kubectl get job file-cache-hog -n "$NAMESPACE" -o wide 2>/dev/null || true
+        echo "# Diagnostic: soomkiller logs (last 30 lines)"
+        local sk_pod
+        sk_pod=$(kubectl get pod -n "$NAMESPACE" -l app=kube-soomkiller \
+            --field-selector spec.nodeName="$node" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [[ -n "$sk_pod" ]]; then
+            kubectl logs -n "$NAMESPACE" "$sk_pod" --tail=30 2>/dev/null || true
+        fi
+    fi
+
+    # Cleanup
+    kubectl delete job file-cache-hog -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+
+    if [[ -n "$soomkill_event" ]]; then
+        echo "ERROR: Pod was falsely soomkilled despite file cache!"
+        echo "$soomkill_event"
+        false
+    fi
+
+    if ! $survived; then
+        echo "ERROR: Pod did not survive the monitoring period (phase=$final_phase)"
+        false
+    fi
+
+    echo "# SUCCESS: Pod with file cache survived soomkiller (swap=${swap_bytes}, cache=${cache_bytes})"
 }
